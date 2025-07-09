@@ -132,9 +132,9 @@ func (r *promotionRepository) GetByCode(ctx context.Context, code string) (*mode
 		return nil, fmt.Errorf("failed to get promotion by code: %w", err)
 	}
 
-	// Cache the result if active
-	if r.cache != nil && promotion.Status == models.PromotionStatusActive {
-		r.cache.Set(ctx, cacheKey, &promotion, 30*time.Minute)
+	// Cache active promotions
+	if promotion.Status == models.PromotionStatusActive {
+		r.cache.Set(ctx, cacheKey, promotion, 30*time.Minute)
 	}
 
 	return &promotion, nil
@@ -151,26 +151,27 @@ func (r *promotionRepository) ValidateCode(ctx context.Context, code string, use
 		return nil, fmt.Errorf("promotion is not active")
 	}
 
-	// Check if promotion is still valid (not expired)
+	// Check validity dates
 	now := time.Now()
-	if promotion.StartDate.After(now) {
-		return nil, fmt.Errorf("promotion has not started yet")
+	if now.Before(promotion.ValidFrom) {
+		return nil, fmt.Errorf("promotion is not yet valid")
 	}
-	if promotion.EndDate.Before(now) {
+	if now.After(promotion.ValidUntil) {
 		return nil, fmt.Errorf("promotion has expired")
 	}
 
 	// Check usage limits
-	if promotion.MaxUses > 0 && promotion.CurrentUses >= promotion.MaxUses {
+	if promotion.UsageLimit > 0 && promotion.UsedCount >= promotion.UsageLimit {
 		return nil, fmt.Errorf("promotion usage limit reached")
 	}
 
-	if promotion.MaxUsesPerUser > 0 {
+	// Check user-specific usage limit
+	if promotion.UserLimit > 0 {
 		userUsage, err := r.getUserPromotionUsage(ctx, userID, promotion.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check user promotion usage: %w", err)
 		}
-		if userUsage >= promotion.MaxUsesPerUser {
+		if userUsage >= int64(promotion.UserLimit) {
 			return nil, fmt.Errorf("user promotion usage limit reached")
 		}
 	}
@@ -203,7 +204,7 @@ func (r *promotionRepository) ValidateCode(ctx context.Context, code string, use
 	if len(promotion.ApplicableRideTypes) > 0 && rideType != "" {
 		rideTypeValid := false
 		for _, applicableRideType := range promotion.ApplicableRideTypes {
-			if applicableRideType == rideType {
+			if string(applicableRideType) == rideType {
 				rideTypeValid = true
 				break
 			}
@@ -213,9 +214,16 @@ func (r *promotionRepository) ValidateCode(ctx context.Context, code string, use
 		}
 	}
 
-	// Check minimum order amount
-	// Note: This would typically be checked against the actual ride fare
-	// For now, we just validate the promotion structure
+	// Check if it's first ride only
+	if promotion.IsFirstRideOnly {
+		rideCount, err := r.getUserRideCount(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check user ride count: %w", err)
+		}
+		if rideCount > 0 {
+			return nil, fmt.Errorf("promotion is only for first ride")
+		}
+	}
 
 	return promotion, nil
 }
@@ -223,9 +231,9 @@ func (r *promotionRepository) ValidateCode(ctx context.Context, code string, use
 // Status operations
 func (r *promotionRepository) GetActivePromotions(ctx context.Context, params *utils.PaginationParams) ([]*models.Promotion, int64, error) {
 	filter := bson.M{
-		"status":     models.PromotionStatusActive,
-		"start_date": bson.M{"$lte": time.Now()},
-		"end_date":   bson.M{"$gte": time.Now()},
+		"status":      models.PromotionStatusActive,
+		"valid_from":  bson.M{"$lte": time.Now()},
+		"valid_until": bson.M{"$gte": time.Now()},
 	}
 	return r.findPromotionsWithFilter(ctx, filter, params)
 }
@@ -239,11 +247,6 @@ func (r *promotionRepository) UpdateStatus(ctx context.Context, id primitive.Obj
 	updates := map[string]interface{}{
 		"status": status,
 	}
-
-	if status == models.PromotionStatusInactive {
-		updates["deactivated_at"] = time.Now()
-	}
-
 	return r.Update(ctx, id, updates)
 }
 
@@ -253,7 +256,7 @@ func (r *promotionRepository) IncrementUsage(ctx context.Context, id primitive.O
 		ctx,
 		bson.M{"_id": id},
 		bson.M{
-			"$inc": bson.M{"current_uses": 1},
+			"$inc": bson.M{"used_count": 1},
 			"$set": bson.M{"updated_at": time.Now()},
 		},
 	)
@@ -273,46 +276,42 @@ func (r *promotionRepository) GetUsageStats(ctx context.Context, id primitive.Ob
 		return nil, err
 	}
 
-	// Get usage by day for the last 30 days
-	startDate := time.Now().AddDate(0, 0, -30)
-
-	// Query ride collection for promotion usage
-	ridesCollection := r.collection.Database().Collection("rides")
+	// Get daily usage over the last 30 days
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
 
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
 			"promotion_id": id,
-			"created_at":   bson.M{"$gte": startDate},
+			"created_at":   bson.M{"$gte": thirtyDaysAgo},
 		}}},
 		{{"$group", bson.M{
 			"_id": bson.M{
-				"date": bson.M{"$dateToString": bson.M{
-					"format": "%Y-%m-%d",
-					"date":   "$created_at",
-				}},
+				"date": bson.M{
+					"$dateToString": bson.M{
+						"format": "%Y-%m-%d",
+						"date":   "$created_at",
+					},
+				},
 			},
-			"usage_count":    bson.M{"$sum": 1},
-			"total_discount": bson.M{"$sum": "$promotion_discount"},
+			"usage_count": bson.M{"$sum": 1},
 		}}},
-		{{"$sort", bson.M{"_id.date": 1}}},
+		{{"$sort", bson.D{{Key: "_id.date", Value: 1}}}},
 	}
 
+	ridesCollection := r.collection.Database().Collection("rides")
 	cursor, err := ridesCollection.Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get promotion usage stats: %w", err)
+		return nil, fmt.Errorf("failed to get usage stats: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var dailyUsage []map[string]interface{}
-	var totalDiscountGiven float64
-
+	dailyUsage := make([]map[string]interface{}, 0)
 	for cursor.Next(ctx) {
 		var result struct {
 			ID struct {
 				Date string `bson:"date"`
 			} `bson:"_id"`
-			UsageCount    int64   `bson:"usage_count"`
-			TotalDiscount float64 `bson:"total_discount"`
+			UsageCount int64 `bson:"usage_count"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
@@ -320,29 +319,24 @@ func (r *promotionRepository) GetUsageStats(ctx context.Context, id primitive.Ob
 		}
 
 		dailyUsage = append(dailyUsage, map[string]interface{}{
-			"date":           result.ID.Date,
-			"usage_count":    result.UsageCount,
-			"total_discount": result.TotalDiscount,
+			"date":        result.ID.Date,
+			"usage_count": result.UsageCount,
 		})
-
-		totalDiscountGiven += result.TotalDiscount
 	}
 
 	usageRate := float64(0)
-	if promotion.MaxUses > 0 {
-		usageRate = float64(promotion.CurrentUses) / float64(promotion.MaxUses) * 100
+	if promotion.UsageLimit > 0 {
+		usageRate = float64(promotion.UsedCount) / float64(promotion.UsageLimit) * 100
 	}
 
 	return map[string]interface{}{
-		"promotion_id":         id,
-		"current_uses":         promotion.CurrentUses,
-		"max_uses":             promotion.MaxUses,
-		"usage_rate":           usageRate,
-		"total_discount_given": totalDiscountGiven,
-		"daily_usage":          dailyUsage,
-		"is_active":            promotion.Status == models.PromotionStatusActive,
-		"start_date":           promotion.StartDate,
-		"end_date":             promotion.EndDate,
+		"promotion_id":   id,
+		"total_used":     promotion.UsedCount,
+		"usage_limit":    promotion.UsageLimit,
+		"usage_rate":     usageRate,
+		"daily_usage":    dailyUsage,
+		"is_active":      promotion.Status == models.PromotionStatusActive,
+		"days_remaining": int(promotion.ValidUntil.Sub(time.Now()).Hours() / 24),
 	}, nil
 }
 
@@ -354,24 +348,26 @@ func (r *promotionRepository) GetByType(ctx context.Context, promotionType model
 
 func (r *promotionRepository) GetApplicablePromotions(ctx context.Context, userType models.UserType, rideType string, amount float64) ([]*models.Promotion, error) {
 	filter := bson.M{
-		"status":     models.PromotionStatusActive,
-		"start_date": bson.M{"$lte": time.Now()},
-		"end_date":   bson.M{"$gte": time.Now()},
+		"status":          models.PromotionStatusActive,
+		"valid_from":      bson.M{"$lte": time.Now()},
+		"valid_until":     bson.M{"$gte": time.Now()},
+		"min_ride_amount": bson.M{"$lte": amount},
 		"$or": []bson.M{
-			{"max_uses": 0}, // Unlimited
-			{"$expr": bson.M{"$lt": []interface{}{"$current_uses", "$max_uses"}}}, // Usage available
-		},
-		"$or": []bson.M{
-			{"applicable_user_types": bson.M{"$size": 0}}, // No restrictions
-			{"applicable_user_types": bson.M{"$in": []models.UserType{userType}}},
-		},
-		"$or": []bson.M{
-			{"minimum_order_amount": bson.M{"$lte": amount}},
-			{"minimum_order_amount": 0}, // No minimum
+			{"usage_limit": 0}, // No limit
+			{"$expr": bson.M{"$lt": []interface{}{"$used_count", "$usage_limit"}}},
 		},
 	}
 
-	// Add ride type filter if specified
+	// Check user type applicability
+	if userType != "" {
+		filter["$or"] = append(filter["$or"].([]bson.M), bson.M{
+			"applicable_user_types": bson.M{"$size": 0}, // No restrictions
+		}, bson.M{
+			"applicable_user_types": bson.M{"$in": []models.UserType{userType}},
+		})
+	}
+
+	// Check ride type applicability
 	if rideType != "" {
 		filter["$or"] = append(filter["$or"].([]bson.M), bson.M{
 			"applicable_ride_types": bson.M{"$size": 0}, // No restrictions
@@ -401,9 +397,9 @@ func (r *promotionRepository) GetApplicablePromotions(ctx context.Context, userT
 // Time-based queries
 func (r *promotionRepository) GetValidPromotions(ctx context.Context, checkTime time.Time) ([]*models.Promotion, error) {
 	filter := bson.M{
-		"status":     models.PromotionStatusActive,
-		"start_date": bson.M{"$lte": checkTime},
-		"end_date":   bson.M{"$gte": checkTime},
+		"status":      models.PromotionStatusActive,
+		"valid_from":  bson.M{"$lte": checkTime},
+		"valid_until": bson.M{"$gte": checkTime},
 	}
 
 	cursor, err := r.collection.Find(ctx, filter)
@@ -426,8 +422,8 @@ func (r *promotionRepository) GetValidPromotions(ctx context.Context, checkTime 
 
 func (r *promotionRepository) GetExpiredPromotions(ctx context.Context) ([]*models.Promotion, error) {
 	filter := bson.M{
-		"status":   models.PromotionStatusActive,
-		"end_date": bson.M{"$lt": time.Now()},
+		"status":      models.PromotionStatusActive,
+		"valid_until": bson.M{"$lt": time.Now()},
 	}
 
 	cursor, err := r.collection.Find(ctx, filter)
@@ -450,23 +446,9 @@ func (r *promotionRepository) GetExpiredPromotions(ctx context.Context) ([]*mode
 
 func (r *promotionRepository) GetPromotionsByDateRange(ctx context.Context, startDate, endDate time.Time, params *utils.PaginationParams) ([]*models.Promotion, int64, error) {
 	filter := bson.M{
-		"$or": []bson.M{
-			{
-				"start_date": bson.M{
-					"$gte": startDate,
-					"$lte": endDate,
-				},
-			},
-			{
-				"end_date": bson.M{
-					"$gte": startDate,
-					"$lte": endDate,
-				},
-			},
-			{
-				"start_date": bson.M{"$lte": startDate},
-				"end_date":   bson.M{"$gte": endDate},
-			},
+		"created_at": bson.M{
+			"$gte": startDate,
+			"$lte": endDate,
 		},
 	}
 	return r.findPromotionsWithFilter(ctx, filter, params)
@@ -476,8 +458,8 @@ func (r *promotionRepository) GetPromotionsByDateRange(ctx context.Context, star
 func (r *promotionRepository) SearchPromotions(ctx context.Context, query string, params *utils.PaginationParams) ([]*models.Promotion, int64, error) {
 	filter := bson.M{
 		"$or": []bson.M{
-			{"name": bson.M{"$regex": query, "$options": "i"}},
-			{"code": bson.M{"$regex": strings.ToUpper(query), "$options": "i"}},
+			{"code": bson.M{"$regex": query, "$options": "i"}},
+			{"title": bson.M{"$regex": query, "$options": "i"}},
 			{"description": bson.M{"$regex": query, "$options": "i"}},
 		},
 	}
@@ -487,10 +469,9 @@ func (r *promotionRepository) SearchPromotions(ctx context.Context, query string
 func (r *promotionRepository) GetPromotionsForCity(ctx context.Context, city string, params *utils.PaginationParams) ([]*models.Promotion, int64, error) {
 	filter := bson.M{
 		"$or": []bson.M{
-			{"applicable_cities": bson.M{"$size": 0}}, // No city restrictions
-			{"applicable_cities": bson.M{"$in": []string{city}}},
+			{"target_cities": bson.M{"$size": 0}}, // No city restrictions
+			{"target_cities": bson.M{"$in": []string{city}}},
 		},
-		"status": models.PromotionStatusActive,
 	}
 	return r.findPromotionsWithFilter(ctx, filter, params)
 }
@@ -499,123 +480,81 @@ func (r *promotionRepository) GetPromotionsForCity(ctx context.Context, city str
 func (r *promotionRepository) GetPromotionStats(ctx context.Context, days int) (map[string]interface{}, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
 
-	// Total promotions
-	totalPromotions, err := r.collection.CountDocuments(ctx, bson.M{
-		"created_at": bson.M{"$gte": startDate},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to count total promotions: %w", err)
-	}
-
-	// Active promotions
-	activePromotions, err := r.collection.CountDocuments(ctx, bson.M{
-		"status":     models.PromotionStatusActive,
-		"start_date": bson.M{"$lte": time.Now()},
-		"end_date":   bson.M{"$gte": time.Now()},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to count active promotions: %w", err)
-	}
-
-	// Promotions by type
-	typePipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
-		}}},
+	pipeline := mongo.Pipeline{
+		{{"$match", bson.M{"created_at": bson.M{"$gte": startDate}}}},
 		{{"$group", bson.M{
-			"_id":   "$type",
-			"count": bson.M{"$sum": 1},
+			"_id":         "$status",
+			"count":       bson.M{"$sum": 1},
+			"total_usage": bson.M{"$sum": "$used_count"},
+			"avg_usage":   bson.M{"$avg": "$used_count"},
 		}}},
 	}
 
-	cursor, err := r.collection.Aggregate(ctx, typePipeline)
+	cursor, err := r.collection.Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get promotions by type: %w", err)
+		return nil, fmt.Errorf("failed to get promotion stats: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	typeCounts := make(map[string]int64)
+	stats := make(map[string]interface{})
+	var totalPromotions int64
+
 	for cursor.Next(ctx) {
 		var result struct {
-			Type  models.PromotionType `bson:"_id"`
-			Count int64                `bson:"count"`
+			ID         models.PromotionStatus `bson:"_id"`
+			Count      int64                  `bson:"count"`
+			TotalUsage int64                  `bson:"total_usage"`
+			AvgUsage   float64                `bson:"avg_usage"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode type count: %w", err)
+			return nil, fmt.Errorf("failed to decode promotion stats: %w", err)
 		}
 
-		typeCounts[string(result.Type)] = result.Count
+		stats[string(result.ID)] = map[string]interface{}{
+			"count":       result.Count,
+			"total_usage": result.TotalUsage,
+			"avg_usage":   result.AvgUsage,
+		}
+
+		totalPromotions += result.Count
 	}
 
-	return map[string]interface{}{
-		"total_promotions":  totalPromotions,
-		"active_promotions": activePromotions,
-		"type_counts":       typeCounts,
-		"period_days":       days,
-		"start_date":        startDate,
-		"end_date":          time.Now(),
-	}, nil
+	stats["summary"] = map[string]interface{}{
+		"total_promotions": totalPromotions,
+		"period_days":      days,
+		"start_date":       startDate,
+		"end_date":         time.Now(),
+	}
+
+	return stats, nil
 }
 
 func (r *promotionRepository) GetTopPromotions(ctx context.Context, limit int, days int) ([]*models.Promotion, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
 
-	// Get promotions used in rides during the period
-	ridesCollection := r.collection.Database().Collection("rides")
-
-	pipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"promotion_id": bson.M{"$ne": nil},
-			"created_at":   bson.M{"$gte": startDate},
-		}}},
-		{{"$group", bson.M{
-			"_id":            "$promotion_id",
-			"usage_count":    bson.M{"$sum": 1},
-			"total_discount": bson.M{"$sum": "$promotion_discount"},
-		}}},
-		{{"$sort", bson.M{"usage_count": -1}}},
-		{{"$limit", limit}},
+	filter := bson.M{
+		"created_at": bson.M{"$gte": startDate},
+		"used_count": bson.M{"$gt": 0},
 	}
 
-	cursor, err := ridesCollection.Aggregate(ctx, pipeline)
+	opts := options.Find().
+		SetSort(bson.D{{Key: "used_count", Value: -1}}).
+		SetLimit(int64(limit))
+
+	cursor, err := r.collection.Find(ctx, filter, opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get top promotions: %w", err)
+		return nil, fmt.Errorf("failed to find top promotions: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var promotionIDs []primitive.ObjectID
-	usageMap := make(map[string]map[string]interface{})
-
+	var promotions []*models.Promotion
 	for cursor.Next(ctx) {
-		var result struct {
-			PromotionID   primitive.ObjectID `bson:"_id"`
-			UsageCount    int64              `bson:"usage_count"`
-			TotalDiscount float64            `bson:"total_discount"`
+		var promotion models.Promotion
+		if err := cursor.Decode(&promotion); err != nil {
+			return nil, fmt.Errorf("failed to decode promotion: %w", err)
 		}
-
-		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode top promotion: %w", err)
-		}
-
-		promotionIDs = append(promotionIDs, result.PromotionID)
-		usageMap[result.PromotionID.Hex()] = map[string]interface{}{
-			"usage_count":    result.UsageCount,
-			"total_discount": result.TotalDiscount,
-		}
-	}
-
-	// Get promotion details
-	promotions := make([]*models.Promotion, 0)
-	for _, id := range promotionIDs {
-		promotion, err := r.GetByID(ctx, id)
-		if err == nil {
-			// Add usage stats to promotion
-			if stats, exists := usageMap[id.Hex()]; exists {
-				promotion.Metadata = stats
-			}
-			promotions = append(promotions, promotion)
-		}
+		promotions = append(promotions, &promotion)
 	}
 
 	return promotions, nil
@@ -624,6 +563,7 @@ func (r *promotionRepository) GetTopPromotions(ctx context.Context, limit int, d
 func (r *promotionRepository) GetPromotionEffectiveness(ctx context.Context, id primitive.ObjectID, days int) (map[string]interface{}, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
 
+	// Get promotion details
 	promotion, err := r.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -640,10 +580,9 @@ func (r *promotionRepository) GetPromotionEffectiveness(ctx context.Context, id 
 		{{"$group", bson.M{
 			"_id":            nil,
 			"total_rides":    bson.M{"$sum": 1},
-			"total_discount": bson.M{"$sum": "$promotion_discount"},
-			"total_fare":     bson.M{"$sum": "$fare.total"},
-			"avg_discount":   bson.M{"$avg": "$promotion_discount"},
-			"unique_users":   bson.M{"$addToSet": "$rider_id"},
+			"total_discount": bson.M{"$sum": "$discount_amount"},
+			"total_revenue":  bson.M{"$sum": "$fare_amount"},
+			"avg_ride_value": bson.M{"$avg": "$fare_amount"},
 		}}},
 	}
 
@@ -654,38 +593,42 @@ func (r *promotionRepository) GetPromotionEffectiveness(ctx context.Context, id 
 	defer cursor.Close(ctx)
 
 	var result struct {
-		TotalRides    int64                `bson:"total_rides"`
-		TotalDiscount float64              `bson:"total_discount"`
-		TotalFare     float64              `bson:"total_fare"`
-		AvgDiscount   float64              `bson:"avg_discount"`
-		UniqueUsers   []primitive.ObjectID `bson:"unique_users"`
+		TotalRides    int64   `bson:"total_rides"`
+		TotalDiscount float64 `bson:"total_discount"`
+		TotalRevenue  float64 `bson:"total_revenue"`
+		AvgRideValue  float64 `bson:"avg_ride_value"`
 	}
 
 	if cursor.Next(ctx) {
 		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode effectiveness stats: %w", err)
+			return nil, fmt.Errorf("failed to decode promotion effectiveness: %w", err)
 		}
 	}
 
-	// Calculate effectiveness metrics
-	discountRate := float64(0)
-	if result.TotalFare > 0 {
-		discountRate = (result.TotalDiscount / result.TotalFare) * 100
+	// Calculate ROI and other metrics
+	roi := float64(0)
+	if result.TotalDiscount > 0 {
+		roi = (result.TotalRevenue - result.TotalDiscount) / result.TotalDiscount * 100
+	}
+
+	conversionRate := float64(0)
+	if promotion.UsageLimit > 0 {
+		conversionRate = float64(result.TotalRides) / float64(promotion.UsageLimit) * 100
 	}
 
 	return map[string]interface{}{
-		"promotion_id":   id,
-		"promotion_name": promotion.Name,
-		"promotion_code": promotion.Code,
-		"total_rides":    result.TotalRides,
-		"unique_users":   len(result.UniqueUsers),
-		"total_discount": result.TotalDiscount,
-		"avg_discount":   result.AvgDiscount,
-		"discount_rate":  discountRate,
-		"cost_per_ride":  result.TotalDiscount / float64(utils.Max(int(result.TotalRides), 1)),
-		"period_days":    days,
-		"start_date":     startDate,
-		"end_date":       time.Now(),
+		"promotion_id":    id,
+		"promotion_code":  promotion.Code,
+		"total_rides":     result.TotalRides,
+		"total_discount":  result.TotalDiscount,
+		"total_revenue":   result.TotalRevenue,
+		"avg_ride_value":  result.AvgRideValue,
+		"roi_percentage":  roi,
+		"conversion_rate": conversionRate,
+		"cost_per_ride":   result.TotalDiscount / float64(result.TotalRides),
+		"period_days":     days,
+		"start_date":      startDate,
+		"end_date":        time.Now(),
 	}, nil
 }
 
@@ -693,12 +636,12 @@ func (r *promotionRepository) GetPromotionEffectiveness(ctx context.Context, id 
 func (r *promotionRepository) findPromotionsWithFilter(ctx context.Context, filter bson.M, params *utils.PaginationParams) ([]*models.Promotion, int64, error) {
 	// Add search filter if provided
 	if params.Search != "" {
-		searchFields := []string{"name", "code", "description"}
-		filter = bson.M{
-			"$and": []bson.M{
-				filter,
-				params.GetSearchFilter(searchFields),
-			},
+		searchFields := []string{"code", "title", "description"}
+		searchFilter := params.GetSearchFilter(searchFields)
+		if len(searchFilter) > 0 {
+			filter = bson.M{
+				"$and": []bson.M{filter, searchFilter},
+			}
 		}
 	}
 
@@ -710,11 +653,6 @@ func (r *promotionRepository) findPromotionsWithFilter(ctx context.Context, filt
 
 	// Get paginated results
 	opts := params.GetSortOptions()
-	// Default sort by created_at descending for promotions
-	if params.Sort == "created_at" || params.Sort == "" {
-		opts.SetSort(bson.D{{Key: "created_at", Value: -1}})
-	}
-
 	cursor, err := r.collection.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to find promotions: %w", err)
@@ -743,6 +681,20 @@ func (r *promotionRepository) getUserPromotionUsage(ctx context.Context, userID,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("failed to count user promotion usage: %w", err)
+	}
+
+	return count, nil
+}
+
+func (r *promotionRepository) getUserRideCount(ctx context.Context, userID primitive.ObjectID) (int64, error) {
+	ridesCollection := r.collection.Database().Collection("rides")
+
+	count, err := ridesCollection.CountDocuments(ctx, bson.M{
+		"rider_id": userID,
+		"status":   bson.M{"$in": []string{"completed", "ongoing"}},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to count user rides: %w", err)
 	}
 
 	return count, nil

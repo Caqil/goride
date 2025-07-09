@@ -102,7 +102,7 @@ func (r *paymentRepository) Delete(ctx context.Context, id primitive.ObjectID) e
 // Transaction operations
 func (r *paymentRepository) GetByTransactionID(ctx context.Context, transactionID string) (*models.Payment, error) {
 	// Try cache first
-	cacheKey := fmt.Sprintf("payment_tx_%s", transactionID)
+	cacheKey := fmt.Sprintf("payment_txn_%s", transactionID)
 	if r.cache != nil {
 		var payment models.Payment
 		if err := r.cache.Get(ctx, cacheKey, &payment); err == nil {
@@ -120,8 +120,8 @@ func (r *paymentRepository) GetByTransactionID(ctx context.Context, transactionI
 	}
 
 	// Cache the result
-	if r.cache != nil {
-		r.cache.Set(ctx, cacheKey, &payment, 30*time.Minute)
+	if payment.Status == models.PaymentStatusCompleted {
+		r.cache.Set(ctx, cacheKey, payment, 30*time.Minute)
 	}
 
 	return &payment, nil
@@ -129,7 +129,7 @@ func (r *paymentRepository) GetByTransactionID(ctx context.Context, transactionI
 
 func (r *paymentRepository) GetByExternalID(ctx context.Context, externalID string) (*models.Payment, error) {
 	var payment models.Payment
-	err := r.collection.FindOne(ctx, bson.M{"external_id": externalID}).Decode(&payment)
+	err := r.collection.FindOne(ctx, bson.M{"external_payment_id": externalID}).Decode(&payment)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, fmt.Errorf("payment not found with external ID")
@@ -145,14 +145,11 @@ func (r *paymentRepository) UpdateStatus(ctx context.Context, id primitive.Objec
 		"status": status,
 	}
 
-	// Add status-specific timestamps
 	switch status {
 	case models.PaymentStatusCompleted:
-		updates["completed_at"] = time.Now()
+		updates["processed_at"] = time.Now()
 	case models.PaymentStatusFailed:
 		updates["failed_at"] = time.Now()
-	case models.PaymentStatusCancelled:
-		updates["cancelled_at"] = time.Now()
 	case models.PaymentStatusRefunded:
 		updates["refunded_at"] = time.Now()
 	}
@@ -183,18 +180,20 @@ func (r *paymentRepository) GetByRideID(ctx context.Context, rideID primitive.Ob
 }
 
 func (r *paymentRepository) GetPaymentForRide(ctx context.Context, rideID primitive.ObjectID) (*models.Payment, error) {
+	filter := bson.M{
+		"ride_id":      rideID,
+		"payment_type": models.PaymentTypeRide,
+		"status": bson.M{"$in": []models.PaymentStatus{
+			models.PaymentStatusCompleted,
+			models.PaymentStatusPending,
+		}},
+	}
+
 	var payment models.Payment
-	err := r.collection.FindOne(
-		ctx,
-		bson.M{
-			"ride_id": rideID,
-			"type":    models.PaymentTypeRide,
-		},
-		options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}),
-	).Decode(&payment)
+	err := r.collection.FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}})).Decode(&payment)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("no payment found for ride")
+			return nil, fmt.Errorf("payment not found for ride")
 		}
 		return nil, fmt.Errorf("failed to get payment for ride: %w", err)
 	}
@@ -220,7 +219,7 @@ func (r *paymentRepository) GetByPaymentMethod(ctx context.Context, method model
 }
 
 func (r *paymentRepository) GetByPaymentType(ctx context.Context, paymentType models.PaymentType, params *utils.PaginationParams) ([]*models.Payment, int64, error) {
-	filter := bson.M{"type": paymentType}
+	filter := bson.M{"payment_type": paymentType}
 	return r.findPaymentsWithFilter(ctx, filter, params)
 }
 
@@ -268,17 +267,17 @@ func (r *paymentRepository) GetPaymentsByDateRange(ctx context.Context, startDat
 }
 
 func (r *paymentRepository) GetDailyPayments(ctx context.Context, date time.Time) ([]*models.Payment, error) {
-	startOfDay := utils.GetStartOfDay(date)
-	endOfDay := utils.GetEndOfDay(date)
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+	endOfDay := startOfDay.Add(24 * time.Hour)
 
 	filter := bson.M{
 		"created_at": bson.M{
 			"$gte": startOfDay,
-			"$lte": endOfDay,
+			"$lt":  endOfDay,
 		},
 	}
 
-	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: 1}}))
+	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to find daily payments: %w", err)
 	}
@@ -298,84 +297,21 @@ func (r *paymentRepository) GetDailyPayments(ctx context.Context, date time.Time
 
 // Refund operations
 func (r *paymentRepository) ProcessRefund(ctx context.Context, id primitive.ObjectID, refundAmount float64, reason string) error {
-	// Start a transaction to ensure consistency
-	session, err := r.collection.Database().Client().StartSession()
-	if err != nil {
-		return fmt.Errorf("failed to start session: %w", err)
-	}
-	defer session.EndSession(ctx)
-
-	err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
-		// Get the original payment
-		payment, err := r.GetByID(sc, id)
-		if err != nil {
-			return err
-		}
-
-		// Validate refund amount
-		if refundAmount > payment.Amount {
-			return fmt.Errorf("refund amount cannot be greater than original payment amount")
-		}
-
-		// Create refund record
-		refund := &models.Payment{
-			ID:            primitive.NewObjectID(),
-			RideID:        payment.RideID,
-			PayerID:       payment.PayeeID, // Company pays back to customer
-			PayeeID:       payment.PayerID, // Customer receives refund
-			Amount:        refundAmount,
-			Currency:      payment.Currency,
-			PaymentMethod: payment.PaymentMethod,
-			PaymentType:          models.PaymentTypeRefund,
-			Status:        models.PaymentStatusCompleted,
-			Description:   fmt.Sprintf("Refund for payment %s: %s", payment.ID.Hex(), reason),
-			Metadata: map[string]interface{}{
-				"original_payment_id": payment.ID,
-				"refund_reason":       reason,
-			},
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-			CompletedAt: &[]time.Time{time.Now()}[0],
-		}
-
-		// Insert refund record
-		_, err = r.collection.InsertOne(sc, refund)
-		if err != nil {
-			return fmt.Errorf("failed to create refund record: %w", err)
-		}
-
-		// Update original payment status
-		updates := map[string]interface{}{
-			"status":        models.PaymentStatusRefunded,
-			"refunded_at":   time.Now(),
-			"refund_amount": refundAmount,
-			"refund_reason": reason,
-		}
-
-		_, err = r.collection.UpdateOne(
-			sc,
-			bson.M{"_id": id},
-			bson.M{"$set": updates},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update original payment: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to process refund: %w", err)
+	updates := map[string]interface{}{
+		"status":         models.PaymentStatusRefunded,
+		"refund_amount":  refundAmount,
+		"failure_reason": reason,
+		"refunded_at":    time.Now(),
 	}
 
-	// Invalidate cache
-	r.invalidatePaymentCache(ctx, id.Hex())
-
-	return nil
+	return r.Update(ctx, id, updates)
 }
 
 func (r *paymentRepository) GetRefunds(ctx context.Context, params *utils.PaginationParams) ([]*models.Payment, int64, error) {
-	filter := bson.M{"type": models.PaymentTypeRefund}
+	filter := bson.M{
+		"status":        models.PaymentStatusRefunded,
+		"refund_amount": bson.M{"$gt": 0},
+	}
 	return r.findPaymentsWithFilter(ctx, filter, params)
 }
 
@@ -383,20 +319,20 @@ func (r *paymentRepository) GetRefunds(ctx context.Context, params *utils.Pagina
 func (r *paymentRepository) GetRevenueStats(ctx context.Context, startDate, endDate time.Time) (map[string]interface{}, error) {
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
+			"status": models.PaymentStatusCompleted,
 			"created_at": bson.M{
 				"$gte": startDate,
 				"$lte": endDate,
 			},
-			"status": models.PaymentStatusCompleted,
-			"type":   bson.M{"$ne": models.PaymentTypeRefund}, // Exclude refunds
 		}}},
 		{{"$group", bson.M{
-			"_id":            nil,
-			"total_revenue":  bson.M{"$sum": "$amount"},
-			"total_payments": bson.M{"$sum": 1},
-			"avg_payment":    bson.M{"$avg": "$amount"},
-			"min_payment":    bson.M{"$min": "$amount"},
-			"max_payment":    bson.M{"$max": "$amount"},
+			"_id":                   nil,
+			"total_revenue":         bson.M{"$sum": "$total_amount"},
+			"platform_fees":         bson.M{"$sum": "$platform_fee"},
+			"driver_earnings":       bson.M{"$sum": "$driver_earnings"},
+			"tax_collected":         bson.M{"$sum": "$tax_amount"},
+			"total_transactions":    bson.M{"$sum": 1},
+			"avg_transaction_value": bson.M{"$avg": "$total_amount"},
 		}}},
 	}
 
@@ -407,11 +343,12 @@ func (r *paymentRepository) GetRevenueStats(ctx context.Context, startDate, endD
 	defer cursor.Close(ctx)
 
 	var result struct {
-		TotalRevenue  float64 `bson:"total_revenue"`
-		TotalPayments int64   `bson:"total_payments"`
-		AvgPayment    float64 `bson:"avg_payment"`
-		MinPayment    float64 `bson:"min_payment"`
-		MaxPayment    float64 `bson:"max_payment"`
+		TotalRevenue        float64 `bson:"total_revenue"`
+		PlatformFees        float64 `bson:"platform_fees"`
+		DriverEarnings      float64 `bson:"driver_earnings"`
+		TaxCollected        float64 `bson:"tax_collected"`
+		TotalTransactions   int64   `bson:"total_transactions"`
+		AvgTransactionValue float64 `bson:"avg_transaction_value"`
 	}
 
 	if cursor.Next(ctx) {
@@ -420,153 +357,105 @@ func (r *paymentRepository) GetRevenueStats(ctx context.Context, startDate, endD
 		}
 	}
 
-	// Get refunds for the same period
-	refundPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{
-				"$gte": startDate,
-				"$lte": endDate,
-			},
-			"type":   models.PaymentTypeRefund,
-			"status": models.PaymentStatusCompleted,
-		}}},
-		{{"$group", bson.M{
-			"_id":           nil,
-			"total_refunds": bson.M{"$sum": "$amount"},
-			"refund_count":  bson.M{"$sum": 1},
-		}}},
-	}
-
-	cursor, err = r.collection.Aggregate(ctx, refundPipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get refund stats: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var refundResult struct {
-		TotalRefunds float64 `bson:"total_refunds"`
-		RefundCount  int64   `bson:"refund_count"`
-	}
-
-	if cursor.Next(ctx) {
-		cursor.Decode(&refundResult)
-	}
-
-	netRevenue := result.TotalRevenue - refundResult.TotalRefunds
-
 	return map[string]interface{}{
-		"total_revenue":  result.TotalRevenue,
-		"total_refunds":  refundResult.TotalRefunds,
-		"net_revenue":    netRevenue,
-		"total_payments": result.TotalPayments,
-		"refund_count":   refundResult.RefundCount,
-		"avg_payment":    result.AvgPayment,
-		"min_payment":    result.MinPayment,
-		"max_payment":    result.MaxPayment,
-		"start_date":     startDate,
-		"end_date":       endDate,
+		"total_revenue":         result.TotalRevenue,
+		"platform_fees":         result.PlatformFees,
+		"driver_earnings":       result.DriverEarnings,
+		"tax_collected":         result.TaxCollected,
+		"total_transactions":    result.TotalTransactions,
+		"avg_transaction_value": result.AvgTransactionValue,
+		"start_date":            startDate,
+		"end_date":              endDate,
 	}, nil
 }
 
 func (r *paymentRepository) GetPaymentStats(ctx context.Context, startDate, endDate time.Time) (map[string]interface{}, error) {
-	// Payments by method
-	methodPipeline := mongo.Pipeline{
+	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
 			"created_at": bson.M{
 				"$gte": startDate,
 				"$lte": endDate,
 			},
-			"status": models.PaymentStatusCompleted,
 		}}},
 		{{"$group", bson.M{
-			"_id":          "$payment_method",
+			"_id":          "$status",
 			"count":        bson.M{"$sum": 1},
-			"total_amount": bson.M{"$sum": "$amount"},
+			"total_amount": bson.M{"$sum": "$total_amount"},
 		}}},
 	}
 
-	cursor, err := r.collection.Aggregate(ctx, methodPipeline)
+	cursor, err := r.collection.Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get payment method stats: %w", err)
+		return nil, fmt.Errorf("failed to get payment stats: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	methodStats := make(map[string]map[string]interface{})
+	stats := make(map[string]interface{})
+	var totalCount int64
+	var totalAmount float64
+
 	for cursor.Next(ctx) {
 		var result struct {
-			Method      models.PaymentMethod `bson:"_id"`
+			ID          models.PaymentStatus `bson:"_id"`
 			Count       int64                `bson:"count"`
 			TotalAmount float64              `bson:"total_amount"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode method stats: %w", err)
+			return nil, fmt.Errorf("failed to decode payment stats: %w", err)
 		}
 
-		methodStats[string(result.Method)] = map[string]interface{}{
+		stats[string(result.ID)] = map[string]interface{}{
 			"count":        result.Count,
 			"total_amount": result.TotalAmount,
 		}
+
+		totalCount += result.Count
+		totalAmount += result.TotalAmount
 	}
 
-	// Payments by status
-	statusPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{
-				"$gte": startDate,
-				"$lte": endDate,
-			},
-		}}},
-		{{"$group", bson.M{
-			"_id":   "$status",
-			"count": bson.M{"$sum": 1},
-		}}},
-	}
-
-	cursor, err = r.collection.Aggregate(ctx, statusPipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get payment status stats: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	statusStats := make(map[string]int64)
-	for cursor.Next(ctx) {
-		var result struct {
-			Status models.PaymentStatus `bson:"_id"`
-			Count  int64                `bson:"count"`
+	// Calculate success rate
+	completedCount := int64(0)
+	if completed, exists := stats[string(models.PaymentStatusCompleted)]; exists {
+		if countMap, ok := completed.(map[string]interface{}); ok {
+			if count, ok := countMap["count"].(int64); ok {
+				completedCount = count
+			}
 		}
-
-		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode status stats: %w", err)
-		}
-
-		statusStats[string(result.Status)] = result.Count
 	}
 
-	return map[string]interface{}{
-		"method_stats": methodStats,
-		"status_stats": statusStats,
+	successRate := float64(0)
+	if totalCount > 0 {
+		successRate = float64(completedCount) / float64(totalCount) * 100
+	}
+
+	stats["summary"] = map[string]interface{}{
+		"total_count":  totalCount,
+		"total_amount": totalAmount,
+		"success_rate": successRate,
 		"start_date":   startDate,
 		"end_date":     endDate,
-	}, nil
+	}
+
+	return stats, nil
 }
 
 func (r *paymentRepository) GetDriverEarnings(ctx context.Context, driverID primitive.ObjectID, startDate, endDate time.Time) (map[string]interface{}, error) {
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
 			"payee_id": driverID,
+			"status":   models.PaymentStatusCompleted,
 			"created_at": bson.M{
 				"$gte": startDate,
 				"$lte": endDate,
 			},
-			"status": models.PaymentStatusCompleted,
-			"type":   models.PaymentTypeDriverEarnings,
 		}}},
 		{{"$group", bson.M{
-			"_id":                  nil,
-			"total_earnings":       bson.M{"$sum": "$amount"},
-			"total_rides":          bson.M{"$sum": 1},
-			"avg_earning_per_ride": bson.M{"$avg": "$amount"},
+			"_id":                   nil,
+			"total_earnings":        bson.M{"$sum": "$driver_earnings"},
+			"total_rides":           bson.M{"$sum": 1},
+			"total_tips":            bson.M{"$sum": "$tip_amount"},
+			"avg_earnings_per_ride": bson.M{"$avg": "$driver_earnings"},
 		}}},
 	}
 
@@ -577,9 +466,10 @@ func (r *paymentRepository) GetDriverEarnings(ctx context.Context, driverID prim
 	defer cursor.Close(ctx)
 
 	var result struct {
-		TotalEarnings     float64 `bson:"total_earnings"`
-		TotalRides        int64   `bson:"total_rides"`
-		AvgEarningPerRide float64 `bson:"avg_earning_per_ride"`
+		TotalEarnings      float64 `bson:"total_earnings"`
+		TotalRides         int64   `bson:"total_rides"`
+		TotalTips          float64 `bson:"total_tips"`
+		AvgEarningsPerRide float64 `bson:"avg_earnings_per_ride"`
 	}
 
 	if cursor.Next(ctx) {
@@ -588,65 +478,14 @@ func (r *paymentRepository) GetDriverEarnings(ctx context.Context, driverID prim
 		}
 	}
 
-	// Daily breakdown
-	dailyPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"payee_id": driverID,
-			"created_at": bson.M{
-				"$gte": startDate,
-				"$lte": endDate,
-			},
-			"status": models.PaymentStatusCompleted,
-			"type":   models.PaymentTypeDriverEarnings,
-		}}},
-		{{"$group", bson.M{
-			"_id": bson.M{
-				"date": bson.M{"$dateToString": bson.M{
-					"format": "%Y-%m-%d",
-					"date":   "$created_at",
-				}},
-			},
-			"daily_earnings": bson.M{"$sum": "$amount"},
-			"daily_rides":    bson.M{"$sum": 1},
-		}}},
-		{{"$sort", bson.M{"_id.date": 1}}},
-	}
-
-	cursor, err = r.collection.Aggregate(ctx, dailyPipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get daily earnings: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var dailyBreakdown []map[string]interface{}
-	for cursor.Next(ctx) {
-		var dailyResult struct {
-			ID struct {
-				Date string `bson:"date"`
-			} `bson:"_id"`
-			DailyEarnings float64 `bson:"daily_earnings"`
-			DailyRides    int64   `bson:"daily_rides"`
-		}
-
-		if err := cursor.Decode(&dailyResult); err != nil {
-			return nil, fmt.Errorf("failed to decode daily earnings: %w", err)
-		}
-
-		dailyBreakdown = append(dailyBreakdown, map[string]interface{}{
-			"date":           dailyResult.ID.Date,
-			"daily_earnings": dailyResult.DailyEarnings,
-			"daily_rides":    dailyResult.DailyRides,
-		})
-	}
-
 	return map[string]interface{}{
-		"driver_id":            driverID,
-		"total_earnings":       result.TotalEarnings,
-		"total_rides":          result.TotalRides,
-		"avg_earning_per_ride": result.AvgEarningPerRide,
-		"daily_breakdown":      dailyBreakdown,
-		"start_date":           startDate,
-		"end_date":             endDate,
+		"driver_id":             driverID,
+		"total_earnings":        result.TotalEarnings,
+		"total_rides":           result.TotalRides,
+		"total_tips":            result.TotalTips,
+		"avg_earnings_per_ride": result.AvgEarningsPerRide,
+		"start_date":            startDate,
+		"end_date":              endDate,
 	}, nil
 }
 
@@ -654,16 +493,15 @@ func (r *paymentRepository) GetDriverEarnings(ctx context.Context, driverID prim
 func (r *paymentRepository) GetTotalRevenue(ctx context.Context, startDate, endDate time.Time) (float64, error) {
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
+			"status": models.PaymentStatusCompleted,
 			"created_at": bson.M{
 				"$gte": startDate,
 				"$lte": endDate,
 			},
-			"status": models.PaymentStatusCompleted,
-			"type":   bson.M{"$ne": models.PaymentTypeRefund},
 		}}},
 		{{"$group", bson.M{
-			"_id":   nil,
-			"total": bson.M{"$sum": "$amount"},
+			"_id":           nil,
+			"total_revenue": bson.M{"$sum": "$total_amount"},
 		}}},
 	}
 
@@ -674,7 +512,7 @@ func (r *paymentRepository) GetTotalRevenue(ctx context.Context, startDate, endD
 	defer cursor.Close(ctx)
 
 	var result struct {
-		Total float64 `bson:"total"`
+		TotalRevenue float64 `bson:"total_revenue"`
 	}
 
 	if cursor.Next(ctx) {
@@ -683,7 +521,7 @@ func (r *paymentRepository) GetTotalRevenue(ctx context.Context, startDate, endD
 		}
 	}
 
-	return result.Total, nil
+	return result.TotalRevenue, nil
 }
 
 func (r *paymentRepository) GetAverageRideValue(ctx context.Context, days int) (float64, error) {
@@ -691,13 +529,13 @@ func (r *paymentRepository) GetAverageRideValue(ctx context.Context, days int) (
 
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
-			"status":     models.PaymentStatusCompleted,
-			"type":       models.PaymentTypeRide,
+			"status":       models.PaymentStatusCompleted,
+			"payment_type": models.PaymentTypeRide,
+			"created_at":   bson.M{"$gte": startDate},
 		}}},
 		{{"$group", bson.M{
-			"_id": nil,
-			"avg": bson.M{"$avg": "$amount"},
+			"_id":       nil,
+			"avg_value": bson.M{"$avg": "$total_amount"},
 		}}},
 	}
 
@@ -708,7 +546,7 @@ func (r *paymentRepository) GetAverageRideValue(ctx context.Context, days int) (
 	defer cursor.Close(ctx)
 
 	var result struct {
-		Avg float64 `bson:"avg"`
+		AvgValue float64 `bson:"avg_value"`
 	}
 
 	if cursor.Next(ctx) {
@@ -717,7 +555,7 @@ func (r *paymentRepository) GetAverageRideValue(ctx context.Context, days int) (
 		}
 	}
 
-	return result.Avg, nil
+	return result.AvgValue, nil
 }
 
 func (r *paymentRepository) GetPaymentMethodStats(ctx context.Context, days int) (map[string]int64, error) {
@@ -725,8 +563,8 @@ func (r *paymentRepository) GetPaymentMethodStats(ctx context.Context, days int)
 
 	pipeline := mongo.Pipeline{
 		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
 			"status":     models.PaymentStatusCompleted,
+			"created_at": bson.M{"$gte": startDate},
 		}}},
 		{{"$group", bson.M{
 			"_id":   "$payment_method",
@@ -741,17 +579,18 @@ func (r *paymentRepository) GetPaymentMethodStats(ctx context.Context, days int)
 	defer cursor.Close(ctx)
 
 	stats := make(map[string]int64)
+
 	for cursor.Next(ctx) {
 		var result struct {
-			Method models.PaymentMethod `bson:"_id"`
-			Count  int64                `bson:"count"`
+			ID    models.PaymentMethod `bson:"_id"`
+			Count int64                `bson:"count"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
 			return nil, fmt.Errorf("failed to decode payment method stats: %w", err)
 		}
 
-		stats[string(result.Method)] = result.Count
+		stats[string(result.ID)] = result.Count
 	}
 
 	return stats, nil
@@ -761,12 +600,12 @@ func (r *paymentRepository) GetPaymentMethodStats(ctx context.Context, days int)
 func (r *paymentRepository) findPaymentsWithFilter(ctx context.Context, filter bson.M, params *utils.PaginationParams) ([]*models.Payment, int64, error) {
 	// Add search filter if provided
 	if params.Search != "" {
-		searchFields := []string{"transaction_id", "external_id", "description"}
-		filter = bson.M{
-			"$and": []bson.M{
-				filter,
-				params.GetSearchFilter(searchFields),
-			},
+		searchFields := []string{"transaction_id", "external_payment_id", "promo_code"}
+		searchFilter := params.GetSearchFilter(searchFields)
+		if len(searchFilter) > 0 {
+			filter = bson.M{
+				"$and": []bson.M{filter, searchFilter},
+			}
 		}
 	}
 
@@ -778,11 +617,6 @@ func (r *paymentRepository) findPaymentsWithFilter(ctx context.Context, filter b
 
 	// Get paginated results
 	opts := params.GetSortOptions()
-	// Default sort by created_at descending for payments
-	if params.Sort == "created_at" || params.Sort == "" {
-		opts.SetSort(bson.D{{Key: "created_at", Value: -1}})
-	}
-
 	cursor, err := r.collection.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to find payments: %w", err)
@@ -805,7 +639,13 @@ func (r *paymentRepository) findPaymentsWithFilter(ctx context.Context, filter b
 func (r *paymentRepository) cachePayment(ctx context.Context, payment *models.Payment) {
 	if r.cache != nil && payment.Status == models.PaymentStatusCompleted {
 		cacheKey := fmt.Sprintf("payment:%s", payment.ID.Hex())
-		r.cache.Set(ctx, cacheKey, payment, 1*time.Hour)
+		r.cache.Set(ctx, cacheKey, payment, 30*time.Minute)
+
+		// Also cache by transaction ID
+		if payment.TransactionID != "" {
+			txnKey := fmt.Sprintf("payment_txn_%s", payment.TransactionID)
+			r.cache.Set(ctx, txnKey, payment, 30*time.Minute)
+		}
 	}
 }
 
@@ -828,5 +668,8 @@ func (r *paymentRepository) invalidatePaymentCache(ctx context.Context, paymentI
 	if r.cache != nil {
 		cacheKey := fmt.Sprintf("payment:%s", paymentID)
 		r.cache.Delete(ctx, cacheKey)
+
+		// Note: We can't easily invalidate the transaction ID cache without knowing the transaction ID
+		// This is a trade-off for performance vs cache consistency
 	}
 }

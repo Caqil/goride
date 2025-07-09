@@ -26,6 +26,7 @@ func NewUserRepository(db *mongo.Database, cache CacheService) interfaces.UserRe
 	}
 }
 
+// Basic CRUD operations
 func (r *userRepository) Create(ctx context.Context, user *models.User) error {
 	user.ID = primitive.NewObjectID()
 	user.CreatedAt = time.Now()
@@ -82,155 +83,155 @@ func (r *userRepository) Update(ctx context.Context, id primitive.ObjectID, upda
 }
 
 func (r *userRepository) Delete(ctx context.Context, id primitive.ObjectID) error {
-	_, err := r.collection.UpdateOne(
-		ctx,
-		bson.M{"_id": id},
-		bson.M{"$set": bson.M{"deleted_at": time.Now()}},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to delete user: %w", err)
+	// Soft delete - set deleted_at timestamp
+	updates := map[string]interface{}{
+		"deleted_at": time.Now(),
 	}
 
-	// Invalidate cache
-	r.invalidateUserCache(ctx, id.Hex())
-
-	return nil
+	return r.Update(ctx, id, updates)
 }
 
+// Authentication operations
 func (r *userRepository) GetByEmail(ctx context.Context, email string) (*models.User, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("user_email_%s", email)
+	if r.cache != nil {
+		var user models.User
+		if err := r.cache.Get(ctx, cacheKey, &user); err == nil {
+			return &user, nil
+		}
+	}
+
 	var user models.User
 	err := r.collection.FindOne(ctx, bson.M{
 		"email":      email,
 		"deleted_at": nil,
 	}).Decode(&user)
-
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("user not found")
+			return nil, fmt.Errorf("user not found with email")
 		}
 		return nil, fmt.Errorf("failed to get user by email: %w", err)
 	}
+
+	// Cache the result
+	if r.cache != nil {
+		r.cache.Set(ctx, cacheKey, user, 15*time.Minute)
+	}
+	r.cacheUser(ctx, &user)
 
 	return &user, nil
 }
 
 func (r *userRepository) GetByPhone(ctx context.Context, phone string) (*models.User, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("user_phone_%s", phone)
+	if r.cache != nil {
+		var user models.User
+		if err := r.cache.Get(ctx, cacheKey, &user); err == nil {
+			return &user, nil
+		}
+	}
+
 	var user models.User
 	err := r.collection.FindOne(ctx, bson.M{
 		"phone":      phone,
 		"deleted_at": nil,
 	}).Decode(&user)
-
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("user not found")
+			return nil, fmt.Errorf("user not found with phone")
 		}
 		return nil, fmt.Errorf("failed to get user by phone: %w", err)
 	}
+
+	// Cache the result
+	if r.cache != nil {
+		r.cache.Set(ctx, cacheKey, user, 15*time.Minute)
+	}
+	r.cacheUser(ctx, &user)
 
 	return &user, nil
 }
 
 func (r *userRepository) GetBySocialID(ctx context.Context, provider string, socialID string) (*models.User, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("user_social_%s_%s", provider, socialID)
+	if r.cache != nil {
+		var user models.User
+		if err := r.cache.Get(ctx, cacheKey, &user); err == nil {
+			return &user, nil
+		}
+	}
+
 	var user models.User
 	err := r.collection.FindOne(ctx, bson.M{
 		"auth_provider": provider,
 		"social_id":     socialID,
 		"deleted_at":    nil,
 	}).Decode(&user)
-
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("user not found")
+			return nil, fmt.Errorf("user not found with social ID")
 		}
 		return nil, fmt.Errorf("failed to get user by social ID: %w", err)
 	}
 
+	// Cache the result
+	if r.cache != nil {
+		r.cache.Set(ctx, cacheKey, user, 15*time.Minute)
+	}
+	r.cacheUser(ctx, &user)
+
 	return &user, nil
 }
 
+// Verification operations
 func (r *userRepository) UpdateEmailVerification(ctx context.Context, id primitive.ObjectID, verified bool) error {
-	return r.Update(ctx, id, map[string]interface{}{
+	updates := map[string]interface{}{
 		"is_email_verified": verified,
-	})
+	}
+	return r.Update(ctx, id, updates)
 }
 
 func (r *userRepository) UpdatePhoneVerification(ctx context.Context, id primitive.ObjectID, verified bool) error {
-	return r.Update(ctx, id, map[string]interface{}{
+	updates := map[string]interface{}{
 		"is_phone_verified": verified,
-	})
+	}
+	return r.Update(ctx, id, updates)
 }
 
 func (r *userRepository) UpdateLastLogin(ctx context.Context, id primitive.ObjectID) error {
 	now := time.Now()
-	return r.Update(ctx, id, map[string]interface{}{
-		"last_login_at":  now,
-		"last_active_at": now,
-	})
+	updates := map[string]interface{}{
+		"last_login_at":  &now,
+		"last_active_at": &now,
+	}
+	return r.Update(ctx, id, updates)
 }
 
 func (r *userRepository) UpdateLastActive(ctx context.Context, id primitive.ObjectID) error {
-	return r.Update(ctx, id, map[string]interface{}{
-		"last_active_at": time.Now(),
-	})
+	now := time.Now()
+	updates := map[string]interface{}{
+		"last_active_at": &now,
+	}
+	return r.Update(ctx, id, updates)
 }
 
+// Search and listing
 func (r *userRepository) List(ctx context.Context, params *utils.PaginationParams) ([]*models.User, int64, error) {
 	filter := bson.M{"deleted_at": nil}
-
-	// Add search filter if provided
-	if params.Search != "" {
-		searchFields := []string{"first_name", "last_name", "email", "phone"}
-		filter = bson.M{
-			"$and": []bson.M{
-				filter,
-				params.GetSearchFilter(searchFields),
-			},
-		}
-	}
-
-	// Get total count
-	total, err := r.collection.CountDocuments(ctx, filter)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to count users: %w", err)
-	}
-
-	// Get paginated results
-	opts := params.GetSortOptions()
-	cursor, err := r.collection.Find(ctx, filter, opts)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to find users: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var users []*models.User
-	for cursor.Next(ctx) {
-		var user models.User
-		if err := cursor.Decode(&user); err != nil {
-			return nil, 0, fmt.Errorf("failed to decode user: %w", err)
-		}
-		users = append(users, &user)
-	}
-
-	return users, total, nil
+	return r.findUsersWithFilter(ctx, filter, params)
 }
 
 func (r *userRepository) SearchByName(ctx context.Context, name string, params *utils.PaginationParams) ([]*models.User, int64, error) {
 	filter := bson.M{
-		"deleted_at": nil,
 		"$or": []bson.M{
 			{"first_name": bson.M{"$regex": name, "$options": "i"}},
 			{"last_name": bson.M{"$regex": name, "$options": "i"}},
-			{"$expr": bson.M{
-				"$regexMatch": bson.M{
-					"input":   bson.M{"$concat": []string{"$first_name", " ", "$last_name"}},
-					"regex":   name,
-					"options": "i",
-				},
-			}},
 		},
+		"deleted_at": nil,
 	}
-
 	return r.findUsersWithFilter(ctx, filter, params)
 }
 
@@ -239,7 +240,6 @@ func (r *userRepository) GetByStatus(ctx context.Context, status models.UserStat
 		"status":     status,
 		"deleted_at": nil,
 	}
-
 	return r.findUsersWithFilter(ctx, filter, params)
 }
 
@@ -248,10 +248,10 @@ func (r *userRepository) GetByType(ctx context.Context, userType models.UserType
 		"user_type":  userType,
 		"deleted_at": nil,
 	}
-
 	return r.findUsersWithFilter(ctx, filter, params)
 }
 
+// Statistics
 func (r *userRepository) GetTotalCount(ctx context.Context) (int64, error) {
 	return r.collection.CountDocuments(ctx, bson.M{"deleted_at": nil})
 }
@@ -317,6 +317,17 @@ func (r *userRepository) GetRegistrationStats(ctx context.Context, days int) (ma
 
 // Helper methods
 func (r *userRepository) findUsersWithFilter(ctx context.Context, filter bson.M, params *utils.PaginationParams) ([]*models.User, int64, error) {
+	// Add search filter if provided
+	if params.Search != "" {
+		searchFields := []string{"first_name", "last_name", "email", "phone"}
+		searchFilter := params.GetSearchFilter(searchFields)
+		if len(searchFilter) > 0 {
+			filter = bson.M{
+				"$and": []bson.M{filter, searchFilter},
+			}
+		}
+	}
+
 	// Get total count
 	total, err := r.collection.CountDocuments(ctx, filter)
 	if err != nil {
@@ -348,6 +359,23 @@ func (r *userRepository) cacheUser(ctx context.Context, user *models.User) {
 	if r.cache != nil {
 		cacheKey := fmt.Sprintf("user:%s", user.ID.Hex())
 		r.cache.Set(ctx, cacheKey, user, 15*time.Minute)
+
+		// Also cache by email and phone for auth lookups
+		if user.Email != "" {
+			emailKey := fmt.Sprintf("user_email_%s", user.Email)
+			r.cache.Set(ctx, emailKey, user, 15*time.Minute)
+		}
+
+		if user.Phone != "" {
+			phoneKey := fmt.Sprintf("user_phone_%s", user.Phone)
+			r.cache.Set(ctx, phoneKey, user, 15*time.Minute)
+		}
+
+		// Also cache by social ID if exists
+		if user.SocialID != "" && user.AuthProvider != "" {
+			socialKey := fmt.Sprintf("user_social_%s_%s", user.AuthProvider, user.SocialID)
+			r.cache.Set(ctx, socialKey, user, 15*time.Minute)
+		}
 	}
 }
 
@@ -370,12 +398,10 @@ func (r *userRepository) invalidateUserCache(ctx context.Context, userID string)
 	if r.cache != nil {
 		cacheKey := fmt.Sprintf("user:%s", userID)
 		r.cache.Delete(ctx, cacheKey)
-	}
-}
 
-// Cache service interface
-type CacheService interface {
-	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
-	Get(ctx context.Context, key string, dest interface{}) error
-	Delete(ctx context.Context, keys ...string) error
+		// Note: We can't easily invalidate the email, phone, and social caches
+		// without additional lookups. This is a trade-off for performance vs cache consistency
+		// In a production system, you might want to implement a more sophisticated
+		// cache invalidation strategy
+	}
 }

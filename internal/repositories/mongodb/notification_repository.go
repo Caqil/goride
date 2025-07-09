@@ -97,7 +97,7 @@ func (r *notificationRepository) Delete(ctx context.Context, id primitive.Object
 		return fmt.Errorf("failed to delete notification: %w", err)
 	}
 
-	// Invalidate user's unread count cache
+	// Invalidate cache
 	r.invalidateUnreadCountCache(ctx, notification.UserID)
 
 	return nil
@@ -113,6 +113,10 @@ func (r *notificationRepository) GetUnreadByUserID(ctx context.Context, userID p
 	filter := bson.M{
 		"user_id": userID,
 		"status":  models.NotificationStatusUnread,
+		"$or": []bson.M{
+			{"expires_at": nil},
+			{"expires_at": bson.M{"$gt": time.Now()}},
+		},
 	}
 
 	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
@@ -135,7 +139,7 @@ func (r *notificationRepository) GetUnreadByUserID(ctx context.Context, userID p
 
 func (r *notificationRepository) GetUnreadCount(ctx context.Context, userID primitive.ObjectID) (int64, error) {
 	// Try cache first
-	cacheKey := fmt.Sprintf("unread_count_user_%s", userID.Hex())
+	cacheKey := fmt.Sprintf("unread_count_%s", userID.Hex())
 	if r.cache != nil {
 		var count int64
 		if err := r.cache.Get(ctx, cacheKey, &count); err == nil {
@@ -143,10 +147,16 @@ func (r *notificationRepository) GetUnreadCount(ctx context.Context, userID prim
 		}
 	}
 
-	count, err := r.collection.CountDocuments(ctx, bson.M{
+	filter := bson.M{
 		"user_id": userID,
 		"status":  models.NotificationStatusUnread,
-	})
+		"$or": []bson.M{
+			{"expires_at": nil},
+			{"expires_at": bson.M{"$gt": time.Now()}},
+		},
+	}
+
+	count, err := r.collection.CountDocuments(ctx, filter)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count unread notifications: %w", err)
 	}
@@ -165,11 +175,14 @@ func (r *notificationRepository) MarkAsRead(ctx context.Context, id primitive.Ob
 		"status":  models.NotificationStatusRead,
 		"read_at": time.Now(),
 	}
-
 	return r.Update(ctx, id, updates)
 }
 
 func (r *notificationRepository) MarkAllAsRead(ctx context.Context, userID primitive.ObjectID) error {
+	filter := bson.M{
+		"user_id": userID,
+		"status":  models.NotificationStatusUnread,
+	}
 	updates := bson.M{
 		"$set": bson.M{
 			"status":     models.NotificationStatusRead,
@@ -178,19 +191,12 @@ func (r *notificationRepository) MarkAllAsRead(ctx context.Context, userID primi
 		},
 	}
 
-	_, err := r.collection.UpdateMany(
-		ctx,
-		bson.M{
-			"user_id": userID,
-			"status":  models.NotificationStatusUnread,
-		},
-		updates,
-	)
+	_, err := r.collection.UpdateMany(ctx, filter, updates)
 	if err != nil {
 		return fmt.Errorf("failed to mark all notifications as read: %w", err)
 	}
 
-	// Invalidate unread count cache
+	// Invalidate cache
 	r.invalidateUnreadCountCache(ctx, userID)
 
 	return nil
@@ -203,6 +209,8 @@ func (r *notificationRepository) UpdateStatus(ctx context.Context, id primitive.
 
 	if status == models.NotificationStatusRead {
 		updates["read_at"] = time.Now()
+	} else if status == models.NotificationStatusSent {
+		updates["sent_at"] = time.Now()
 	}
 
 	return r.Update(ctx, id, updates)
@@ -225,11 +233,8 @@ func (r *notificationRepository) GetByUserAndType(ctx context.Context, userID pr
 // Time-based operations
 func (r *notificationRepository) GetExpiredNotifications(ctx context.Context) ([]*models.Notification, error) {
 	filter := bson.M{
-		"expires_at": bson.M{
-			"$exists": true,
-			"$lte":    time.Now(),
-		},
-		"status": bson.M{"$ne": models.NotificationStatusExpired},
+		"expires_at": bson.M{"$lt": time.Now()},
+		"status":     bson.M{"$ne": models.NotificationStatusExpired},
 	}
 
 	cursor, err := r.collection.Find(ctx, filter)
@@ -252,18 +257,14 @@ func (r *notificationRepository) GetExpiredNotifications(ctx context.Context) ([
 
 func (r *notificationRepository) DeleteExpiredNotifications(ctx context.Context) error {
 	filter := bson.M{
-		"expires_at": bson.M{
-			"$exists": true,
-			"$lte":    time.Now(),
-		},
+		"expires_at": bson.M{"$lt": time.Now().AddDate(0, 0, -30)}, // Delete after 30 days of expiry
 	}
 
-	result, err := r.collection.DeleteMany(ctx, filter)
+	_, err := r.collection.DeleteMany(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("failed to delete expired notifications: %w", err)
 	}
 
-	fmt.Printf("Deleted %d expired notifications\n", result.DeletedCount)
 	return nil
 }
 
@@ -283,24 +284,23 @@ func (r *notificationRepository) CreateBatch(ctx context.Context, notifications 
 		return nil
 	}
 
-	// Prepare documents for bulk insert
-	docs := make([]interface{}, len(notifications))
+	documents := make([]interface{}, len(notifications))
 	userIDs := make(map[primitive.ObjectID]bool)
 
 	for i, notification := range notifications {
 		notification.ID = primitive.NewObjectID()
 		notification.CreatedAt = time.Now()
 		notification.UpdatedAt = time.Now()
-		docs[i] = notification
+		documents[i] = notification
 		userIDs[notification.UserID] = true
 	}
 
-	_, err := r.collection.InsertMany(ctx, docs)
+	_, err := r.collection.InsertMany(ctx, documents)
 	if err != nil {
-		return fmt.Errorf("failed to create notifications batch: %w", err)
+		return fmt.Errorf("failed to create batch notifications: %w", err)
 	}
 
-	// Invalidate unread count cache for all affected users
+	// Invalidate cache for all affected users
 	for userID := range userIDs {
 		r.invalidateUnreadCountCache(ctx, userID)
 	}
@@ -322,19 +322,16 @@ func (r *notificationRepository) DeleteByUserID(ctx context.Context, userID prim
 
 func (r *notificationRepository) DeleteOldNotifications(ctx context.Context, days int) error {
 	cutoffDate := time.Now().AddDate(0, 0, -days)
-
-	result, err := r.collection.DeleteMany(ctx, bson.M{
+	filter := bson.M{
 		"created_at": bson.M{"$lt": cutoffDate},
-		"status": bson.M{"$in": []models.NotificationStatus{
-			models.NotificationStatusRead,
-			models.NotificationStatusExpired,
-		}},
-	})
+		"status":     bson.M{"$in": []models.NotificationStatus{models.NotificationStatusRead, models.NotificationStatusExpired}},
+	}
+
+	_, err := r.collection.DeleteMany(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("failed to delete old notifications: %w", err)
 	}
 
-	fmt.Printf("Deleted %d old notifications\n", result.DeletedCount)
 	return nil
 }
 
@@ -342,123 +339,110 @@ func (r *notificationRepository) DeleteOldNotifications(ctx context.Context, day
 func (r *notificationRepository) GetNotificationStats(ctx context.Context, days int) (map[string]interface{}, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
 
-	// Total notifications
-	totalNotifications, err := r.collection.CountDocuments(ctx, bson.M{
-		"created_at": bson.M{"$gte": startDate},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to count total notifications: %w", err)
-	}
-
-	// Notifications by status
-	statusPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
-		}}},
-		{{"$group", bson.M{
-			"_id":   "$status",
-			"count": bson.M{"$sum": 1},
-		}}},
-	}
-
-	cursor, err := r.collection.Aggregate(ctx, statusPipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get notifications by status: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	statusCounts := make(map[string]int64)
-	for cursor.Next(ctx) {
-		var result struct {
-			Status models.NotificationStatus `bson:"_id"`
-			Count  int64                     `bson:"count"`
-		}
-
-		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode status count: %w", err)
-		}
-
-		statusCounts[string(result.Status)] = result.Count
-	}
-
-	// Notifications by type
-	typePipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
-		}}},
+	pipeline := mongo.Pipeline{
+		{{"$match", bson.M{"created_at": bson.M{"$gte": startDate}}}},
 		{{"$group", bson.M{
 			"_id":   "$type",
-			"count": bson.M{"$sum": 1},
+			"total": bson.M{"$sum": 1},
+			"sent": bson.M{"$sum": bson.M{
+				"$cond": []interface{}{
+					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusSent}},
+					1,
+					0,
+				},
+			}},
+			"read": bson.M{"$sum": bson.M{
+				"$cond": []interface{}{
+					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusRead}},
+					1,
+					0,
+				},
+			}},
+			"failed": bson.M{"$sum": bson.M{
+				"$cond": []interface{}{
+					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusFailed}},
+					1,
+					0,
+				},
+			}},
 		}}},
 	}
 
-	cursor, err = r.collection.Aggregate(ctx, typePipeline)
+	cursor, err := r.collection.Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get notifications by type: %w", err)
+		return nil, fmt.Errorf("failed to get notification stats: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	typeCounts := make(map[string]int64)
+	stats := make(map[string]interface{})
+	var totalNotifications int64
+
 	for cursor.Next(ctx) {
 		var result struct {
-			Type  models.NotificationType `bson:"_id"`
-			Count int64                   `bson:"count"`
+			ID     models.NotificationType `bson:"_id"`
+			Total  int64                   `bson:"total"`
+			Sent   int64                   `bson:"sent"`
+			Read   int64                   `bson:"read"`
+			Failed int64                   `bson:"failed"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode type count: %w", err)
+			return nil, fmt.Errorf("failed to decode notification stats: %w", err)
 		}
 
-		typeCounts[string(result.Type)] = result.Count
+		stats[string(result.ID)] = map[string]interface{}{
+			"total":        result.Total,
+			"sent":         result.Sent,
+			"read":         result.Read,
+			"failed":       result.Failed,
+			"read_rate":    float64(result.Read) / float64(result.Total) * 100,
+			"failure_rate": float64(result.Failed) / float64(result.Total) * 100,
+		}
+
+		totalNotifications += result.Total
 	}
 
-	// Read rate calculation
-	readCount := statusCounts[string(models.NotificationStatusRead)]
-	readRate := float64(0)
-	if totalNotifications > 0 {
-		readRate = float64(readCount) / float64(totalNotifications) * 100
-	}
-
-	return map[string]interface{}{
+	stats["summary"] = map[string]interface{}{
 		"total_notifications": totalNotifications,
-		"status_counts":       statusCounts,
-		"type_counts":         typeCounts,
-		"read_rate":           readRate,
 		"period_days":         days,
 		"start_date":          startDate,
 		"end_date":            time.Now(),
-	}, nil
+	}
+
+	return stats, nil
 }
 
 func (r *notificationRepository) GetDeliveryStats(ctx context.Context, days int) (map[string]interface{}, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
 
 	pipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"created_at": bson.M{"$gte": startDate},
-		}}},
+		{{"$match", bson.M{"created_at": bson.M{"$gte": startDate}}}},
 		{{"$group", bson.M{
-			"_id":        nil,
-			"total_sent": bson.M{"$sum": 1},
-			"delivered": bson.M{"$sum": bson.M{
+			"_id": bson.M{
+				"date": bson.M{
+					"$dateToString": bson.M{
+						"format": "%Y-%m-%d",
+						"date":   "$created_at",
+					},
+				},
+			},
+			"created": bson.M{"$sum": 1},
+			"sent": bson.M{"$sum": bson.M{
 				"$cond": []interface{}{
-					bson.M{"$eq": []interface{}{"$delivery_status", "delivered"}},
-					1, 0,
+					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusSent}},
+					1,
+					0,
 				},
 			}},
 			"failed": bson.M{"$sum": bson.M{
 				"$cond": []interface{}{
-					bson.M{"$eq": []interface{}{"$delivery_status", "failed"}},
-					1, 0,
-				},
-			}},
-			"pending": bson.M{"$sum": bson.M{
-				"$cond": []interface{}{
-					bson.M{"$eq": []interface{}{"$delivery_status", "pending"}},
-					1, 0,
+					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusFailed}},
+					1,
+					0,
 				},
 			}},
 		}}},
+		{{"$sort", bson.D{{Key: "_id.date", Value: 1}}}},
 	}
 
 	cursor, err := r.collection.Aggregate(ctx, pipeline)
@@ -467,37 +451,55 @@ func (r *notificationRepository) GetDeliveryStats(ctx context.Context, days int)
 	}
 	defer cursor.Close(ctx)
 
-	var result struct {
-		TotalSent int64 `bson:"total_sent"`
-		Delivered int64 `bson:"delivered"`
-		Failed    int64 `bson:"failed"`
-		Pending   int64 `bson:"pending"`
-	}
+	daily := make([]map[string]interface{}, 0)
+	var totalCreated, totalSent, totalFailed int64
 
-	if cursor.Next(ctx) {
+	for cursor.Next(ctx) {
+		var result struct {
+			ID struct {
+				Date string `bson:"date"`
+			} `bson:"_id"`
+			Created int64 `bson:"created"`
+			Sent    int64 `bson:"sent"`
+			Failed  int64 `bson:"failed"`
+		}
+
 		if err := cursor.Decode(&result); err != nil {
 			return nil, fmt.Errorf("failed to decode delivery stats: %w", err)
 		}
+
+		deliveryRate := float64(0)
+		if result.Created > 0 {
+			deliveryRate = float64(result.Sent) / float64(result.Created) * 100
+		}
+
+		daily = append(daily, map[string]interface{}{
+			"date":          result.ID.Date,
+			"created":       result.Created,
+			"sent":          result.Sent,
+			"failed":        result.Failed,
+			"delivery_rate": deliveryRate,
+		})
+
+		totalCreated += result.Created
+		totalSent += result.Sent
+		totalFailed += result.Failed
 	}
 
-	deliveryRate := float64(0)
-	failureRate := float64(0)
-
-	if result.TotalSent > 0 {
-		deliveryRate = float64(result.Delivered) / float64(result.TotalSent) * 100
-		failureRate = float64(result.Failed) / float64(result.TotalSent) * 100
+	overallDeliveryRate := float64(0)
+	if totalCreated > 0 {
+		overallDeliveryRate = float64(totalSent) / float64(totalCreated) * 100
 	}
 
 	return map[string]interface{}{
-		"total_sent":    result.TotalSent,
-		"delivered":     result.Delivered,
-		"failed":        result.Failed,
-		"pending":       result.Pending,
-		"delivery_rate": deliveryRate,
-		"failure_rate":  failureRate,
-		"period_days":   days,
-		"start_date":    startDate,
-		"end_date":      time.Now(),
+		"daily": daily,
+		"summary": map[string]interface{}{
+			"total_created":         totalCreated,
+			"total_sent":            totalSent,
+			"total_failed":          totalFailed,
+			"overall_delivery_rate": overallDeliveryRate,
+			"period_days":           days,
+		},
 	}, nil
 }
 
@@ -510,16 +512,21 @@ func (r *notificationRepository) GetEngagementStats(ctx context.Context, userID 
 			"created_at": bson.M{"$gte": startDate},
 		}}},
 		{{"$group", bson.M{
-			"_id":            "$type",
-			"total_received": bson.M{"$sum": 1},
-			"total_read": bson.M{"$sum": bson.M{
+			"_id":   "$type",
+			"total": bson.M{"$sum": 1},
+			"read": bson.M{"$sum": bson.M{
 				"$cond": []interface{}{
 					bson.M{"$eq": []interface{}{"$status", models.NotificationStatusRead}},
-					1, 0,
+					1,
+					0,
 				},
 			}},
 			"avg_read_time": bson.M{"$avg": bson.M{
-				"$subtract": []interface{}{"$read_at", "$created_at"},
+				"$cond": []interface{}{
+					bson.M{"$ne": []interface{}{"$read_at", nil}},
+					bson.M{"$subtract": []interface{}{"$read_at", "$created_at"}},
+					nil,
+				},
 			}},
 		}}},
 	}
@@ -530,16 +537,15 @@ func (r *notificationRepository) GetEngagementStats(ctx context.Context, userID 
 	}
 	defer cursor.Close(ctx)
 
-	engagementByType := make(map[string]map[string]interface{})
-	totalReceived := int64(0)
-	totalRead := int64(0)
+	stats := make(map[string]interface{})
+	var totalNotifications, totalRead int64
 
 	for cursor.Next(ctx) {
 		var result struct {
-			Type          models.NotificationType `bson:"_id"`
-			TotalReceived int64                   `bson:"total_received"`
-			TotalRead     int64                   `bson:"total_read"`
-			AvgReadTime   float64                 `bson:"avg_read_time"`
+			ID          models.NotificationType `bson:"_id"`
+			Total       int64                   `bson:"total"`
+			Read        int64                   `bson:"read"`
+			AvgReadTime *float64                `bson:"avg_read_time"`
 		}
 
 		if err := cursor.Decode(&result); err != nil {
@@ -547,36 +553,40 @@ func (r *notificationRepository) GetEngagementStats(ctx context.Context, userID 
 		}
 
 		readRate := float64(0)
-		if result.TotalReceived > 0 {
-			readRate = float64(result.TotalRead) / float64(result.TotalReceived) * 100
+		if result.Total > 0 {
+			readRate = float64(result.Read) / float64(result.Total) * 100
 		}
 
-		engagementByType[string(result.Type)] = map[string]interface{}{
-			"total_received": result.TotalReceived,
-			"total_read":     result.TotalRead,
-			"read_rate":      readRate,
-			"avg_read_time":  result.AvgReadTime / 1000, // Convert to seconds
+		avgReadTimeMinutes := float64(0)
+		if result.AvgReadTime != nil {
+			avgReadTimeMinutes = *result.AvgReadTime / (1000 * 60) // Convert milliseconds to minutes
 		}
 
-		totalReceived += result.TotalReceived
-		totalRead += result.TotalRead
+		stats[string(result.ID)] = map[string]interface{}{
+			"total":                 result.Total,
+			"read":                  result.Read,
+			"read_rate":             readRate,
+			"avg_read_time_minutes": avgReadTimeMinutes,
+		}
+
+		totalNotifications += result.Total
+		totalRead += result.Read
 	}
 
 	overallReadRate := float64(0)
-	if totalReceived > 0 {
-		overallReadRate = float64(totalRead) / float64(totalReceived) * 100
+	if totalNotifications > 0 {
+		overallReadRate = float64(totalRead) / float64(totalNotifications) * 100
 	}
 
-	return map[string]interface{}{
-		"user_id":            userID,
-		"total_received":     totalReceived,
-		"total_read":         totalRead,
-		"overall_read_rate":  overallReadRate,
-		"engagement_by_type": engagementByType,
-		"period_days":        days,
-		"start_date":         startDate,
-		"end_date":           time.Now(),
-	}, nil
+	stats["summary"] = map[string]interface{}{
+		"total_notifications": totalNotifications,
+		"total_read":          totalRead,
+		"overall_read_rate":   overallReadRate,
+		"period_days":         days,
+		"user_id":             userID,
+	}
+
+	return stats, nil
 }
 
 // Helper methods
@@ -584,11 +594,11 @@ func (r *notificationRepository) findNotificationsWithFilter(ctx context.Context
 	// Add search filter if provided
 	if params.Search != "" {
 		searchFields := []string{"title", "message"}
-		filter = bson.M{
-			"$and": []bson.M{
-				filter,
-				params.GetSearchFilter(searchFields),
-			},
+		searchFilter := params.GetSearchFilter(searchFields)
+		if len(searchFilter) > 0 {
+			filter = bson.M{
+				"$and": []bson.M{filter, searchFilter},
+			}
 		}
 	}
 
@@ -600,11 +610,6 @@ func (r *notificationRepository) findNotificationsWithFilter(ctx context.Context
 
 	// Get paginated results
 	opts := params.GetSortOptions()
-	// Default sort by created_at descending for notifications
-	if params.Sort == "created_at" || params.Sort == "" {
-		opts.SetSort(bson.D{{Key: "created_at", Value: -1}})
-	}
-
 	cursor, err := r.collection.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to find notifications: %w", err)
@@ -626,7 +631,7 @@ func (r *notificationRepository) findNotificationsWithFilter(ctx context.Context
 // Cache operations
 func (r *notificationRepository) invalidateUnreadCountCache(ctx context.Context, userID primitive.ObjectID) {
 	if r.cache != nil {
-		cacheKey := fmt.Sprintf("unread_count_user_%s", userID.Hex())
+		cacheKey := fmt.Sprintf("unread_count_%s", userID.Hex())
 		r.cache.Delete(ctx, cacheKey)
 	}
 }
