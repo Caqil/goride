@@ -8,6 +8,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 
 type ratingRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewRatingRepository(db *mongo.Database, cache CacheService) interfaces.RatingRepository {
+func NewRatingRepository(db *mongo.Database, cache services.CacheService) interfaces.RatingRepository {
 	return &ratingRepository{
 		collection: db.Collection("ratings"),
 		cache:      cache,

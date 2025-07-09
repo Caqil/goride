@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,10 +18,10 @@ import (
 
 type emergencyRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewEmergencyRepository(db *mongo.Database, cache CacheService) interfaces.EmergencyRepository {
+func NewEmergencyRepository(db *mongo.Database, cache services.CacheService) interfaces.EmergencyRepository {
 	return &emergencyRepository{
 		collection: db.Collection("emergencies"),
 		cache:      cache,

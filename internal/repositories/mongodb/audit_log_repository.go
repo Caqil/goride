@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,10 +18,10 @@ import (
 
 type auditLogRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewAuditLogRepository(db *mongo.Database, cache CacheService) interfaces.AuditLogRepository {
+func NewAuditLogRepository(db *mongo.Database, cache services.CacheService) interfaces.AuditLogRepository {
 	return &auditLogRepository{
 		collection: db.Collection("audit_logs"),
 		cache:      cache,

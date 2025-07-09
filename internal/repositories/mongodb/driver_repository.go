@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 type driverRepository struct {
 	collection *mongo.Collection
 
-	cache CacheService
+	cache services.CacheService
 }
 
-func NewDriverRepository(db *mongo.Database, cache CacheService) interfaces.DriverRepository {
+func NewDriverRepository(db *mongo.Database, cache services.CacheService) interfaces.DriverRepository {
 	return &driverRepository{
 		collection: db.Collection("drivers"),
 		cache:      cache,
@@ -155,7 +156,11 @@ func (r *driverRepository) GetNearbyDrivers(ctx context.Context, lat, lng, radiu
 	}
 
 	// Add additional filters for active drivers
-	filter["verification_status"] = models.DocumentStatusApproved
+	filter["$and"] = []bson.M{
+		{"license_status": models.DocumentStatusApproved},
+		{"insurance_status": models.DocumentStatusApproved},
+		{"background_check_status": models.DocumentStatusApproved},
+	}
 	filter["last_location_update"] = bson.M{
 		"$gte": time.Now().Add(-10 * time.Minute), // Location updated within last 10 minutes
 	}
@@ -282,30 +287,62 @@ func (r *driverRepository) GetOnlineDrivers(ctx context.Context) ([]*models.Driv
 
 // Document verification
 func (r *driverRepository) UpdateDocumentStatus(ctx context.Context, id primitive.ObjectID, docType string, status models.DocumentStatus) error {
-	updates := map[string]interface{}{
-		fmt.Sprintf("documents.%s.status", docType):      status,
-		fmt.Sprintf("documents.%s.verified_at", docType): time.Now(),
+	updates := map[string]interface{}{}
+
+	// Update the specific document status based on document type
+	switch docType {
+	case "license":
+		updates["license_status"] = status
+	case "insurance":
+		updates["insurance_status"] = status
+	case "background_check":
+		updates["background_check_status"] = status
+		if status == models.DocumentStatusApproved {
+			updates["background_check_date"] = time.Now()
+		}
+	default:
+		return fmt.Errorf("unsupported document type: %s", docType)
 	}
 
-	// If all required documents are approved, update overall verification status
+	// Get current driver to check if all documents are approved
 	driver, err := r.GetByID(ctx, id)
 	if err != nil {
 		return err
 	}
 
 	// Check if all required documents are approved
-	requiredDocs := []string{"license", "vehicle_registration", "insurance"}
 	allApproved := true
 
-	for _, doc := range requiredDocs {
-		if docStatus, exists := driver.Documents[doc]; !exists || docStatus.Status != models.DocumentStatusApproved {
-			allApproved = false
-			break
-		}
+	// Check license status
+	licenseStatus := driver.LicenseStatus
+	if docType == "license" {
+		licenseStatus = status
+	}
+	if licenseStatus != models.DocumentStatusApproved {
+		allApproved = false
 	}
 
+	// Check insurance status
+	insuranceStatus := driver.InsuranceStatus
+	if docType == "insurance" {
+		insuranceStatus = status
+	}
+	if insuranceStatus != models.DocumentStatusApproved {
+		allApproved = false
+	}
+
+	// Check background check status
+	backgroundStatus := driver.BackgroundCheckStatus
+	if docType == "background_check" {
+		backgroundStatus = status
+	}
+	if backgroundStatus != models.DocumentStatusApproved {
+		allApproved = false
+	}
+
+	// If all documents are approved, update approval timestamp
 	if allApproved {
-		updates["verification_status"] = models.DocumentStatusApproved
+		updates["approved_at"] = time.Now()
 	}
 
 	return r.Update(ctx, id, updates)
@@ -313,8 +350,12 @@ func (r *driverRepository) UpdateDocumentStatus(ctx context.Context, id primitiv
 
 func (r *driverRepository) GetPendingVerifications(ctx context.Context, params *utils.PaginationParams) ([]*models.Driver, int64, error) {
 	filter := bson.M{
-		"verification_status": models.DocumentStatusPending,
-		"deleted_at":          nil,
+		"$or": []bson.M{
+			{"license_status": models.DocumentStatusPending},
+			{"insurance_status": models.DocumentStatusPending},
+			{"background_check_status": models.DocumentStatusPending},
+		},
+		"deleted_at": nil,
 	}
 
 	return r.findDriversWithFilter(ctx, filter, params)
@@ -412,13 +453,13 @@ func (r *driverRepository) GetCountByStatus(ctx context.Context, status models.D
 
 func (r *driverRepository) GetAverageRating(ctx context.Context) (float64, error) {
 	pipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"deleted_at":    nil,
-			"total_ratings": bson.M{"$gt": 0}, // Only drivers with ratings
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "deleted_at", Value: nil},
+			{Key: "total_ratings", Value: bson.D{{Key: "$gt", Value: 0}}}, // Only drivers with ratings
 		}}},
-		{{"$group", bson.M{
-			"_id":        nil,
-			"avg_rating": bson.M{"$avg": "$rating"},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "avg_rating", Value: bson.D{{Key: "$avg", Value: "$rating"}}},
 		}}},
 	}
 
@@ -481,14 +522,14 @@ func (r *driverRepository) GetDriverStats(ctx context.Context, driverID primitiv
 
 	// Count rides by status
 	ridesPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"driver_id":  driverID,
-			"created_at": bson.M{"$gte": startDate},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "driver_id", Value: driverID},
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: startDate}}},
 		}}},
-		{{"$group", bson.M{
-			"_id":            "$status",
-			"count":          bson.M{"$sum": 1},
-			"total_earnings": bson.M{"$sum": "$fare.driver_amount"},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$status"},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+			{Key: "total_earnings", Value: bson.D{{Key: "$sum", Value: "$fare.driver_amount"}}},
 		}}},
 	}
 
@@ -545,15 +586,15 @@ func (r *driverRepository) GetDriverStats(ctx context.Context, driverID primitiv
 
 	// Get recent ratings
 	recentRatingsPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"driver_id":     driverID,
-			"created_at":    bson.M{"$gte": startDate},
-			"driver_rating": bson.M{"$exists": true, "$ne": nil},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "driver_id", Value: driverID},
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: startDate}}},
+			{Key: "driver_rating", Value: bson.D{{Key: "$exists", Value: true}, {Key: "$ne", Value: nil}}},
 		}}},
-		{{"$group", bson.M{
-			"_id":          nil,
-			"avg_rating":   bson.M{"$avg": "$driver_rating"},
-			"rating_count": bson.M{"$sum": 1},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "avg_rating", Value: bson.D{{Key: "$avg", Value: "$driver_rating"}}},
+			{Key: "rating_count", Value: bson.D{{Key: "$sum", Value: 1}}},
 		}}},
 	}
 
@@ -604,8 +645,6 @@ func (r *driverRepository) GetDriverStats(ctx context.Context, driverID primitiv
 func (r *driverRepository) findDriversWithFilter(ctx context.Context, filter bson.M, params *utils.PaginationParams) ([]*models.Driver, int64, error) {
 	// Add search filter if provided
 	if params.Search != "" {
-		searchFields := []string{"license_number", "phone", "vehicle_make", "vehicle_model"}
-
 		// Create OR conditions for different search fields
 		searchConditions := []bson.M{}
 

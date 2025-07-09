@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -16,10 +17,10 @@ import (
 
 type userRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewUserRepository(db *mongo.Database, cache CacheService) interfaces.UserRepository {
+func NewUserRepository(db *mongo.Database, cache services.CacheService) interfaces.UserRepository {
 	return &userRepository{
 		collection: db.Collection("users"),
 		cache:      cache,

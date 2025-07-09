@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,10 +18,10 @@ import (
 
 type rideRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewRideRepository(db *mongo.Database, cache CacheService) interfaces.RideRepository {
+func NewRideRepository(db *mongo.Database, cache services.CacheService) interfaces.RideRepository {
 	return &rideRepository{
 		collection: db.Collection("rides"),
 		cache:      cache,

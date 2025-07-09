@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,10 +18,10 @@ import (
 
 type paymentRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewPaymentRepository(db *mongo.Database, cache CacheService) interfaces.PaymentRepository {
+func NewPaymentRepository(db *mongo.Database, cache services.CacheService) interfaces.PaymentRepository {
 	return &paymentRepository{
 		collection: db.Collection("payments"),
 		cache:      cache,

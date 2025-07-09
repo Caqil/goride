@@ -8,6 +8,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 
 type vehicleRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewVehicleRepository(db *mongo.Database, cache CacheService) interfaces.VehicleRepository {
+func NewVehicleRepository(db *mongo.Database, cache services.CacheService) interfaces.VehicleRepository {
 	return &vehicleRepository{
 		collection: db.Collection("vehicles"),
 		cache:      cache,
@@ -242,7 +243,7 @@ func (r *vehicleRepository) UpdateStatus(ctx context.Context, id primitive.Objec
 	// Set specific timestamps based on status
 	switch status {
 	case models.VehicleStatusMaintenance:
-		updates["last_maintenance"] = time.Now()
+		updates["last_maintenance_at"] = time.Now()
 	case models.VehicleStatusSuspended:
 		updates["suspended_at"] = time.Now()
 	}
@@ -282,11 +283,11 @@ func (r *vehicleRepository) UpdateMaintenanceDate(ctx context.Context, id primit
 	updates := map[string]interface{}{}
 
 	if lastMaintenance != nil {
-		updates["last_maintenance"] = *lastMaintenance
+		updates["last_maintenance_at"] = *lastMaintenance
 	}
 
 	if nextMaintenance != nil {
-		updates["next_maintenance"] = *nextMaintenance
+		updates["next_maintenance_at"] = *nextMaintenance
 	}
 
 	return r.Update(ctx, id, updates)
@@ -294,11 +295,11 @@ func (r *vehicleRepository) UpdateMaintenanceDate(ctx context.Context, id primit
 
 func (r *vehicleRepository) GetVehiclesDueForMaintenance(ctx context.Context) ([]*models.Vehicle, error) {
 	filter := bson.M{
-		"next_maintenance": bson.M{"$lte": time.Now()},
-		"status":           bson.M{"$ne": models.VehicleStatusMaintenance},
+		"next_maintenance_at": bson.M{"$lte": time.Now()},
+		"status":              bson.M{"$ne": models.VehicleStatusMaintenance},
 	}
 
-	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "next_maintenance", Value: 1}}))
+	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "next_maintenance_at", Value: 1}}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to find vehicles due for maintenance: %w", err)
 	}
@@ -338,11 +339,11 @@ func (r *vehicleRepository) GetVehicleStats(ctx context.Context, vehicleID primi
 
 	// Get ride counts and stats for the period
 	ridePipeline := mongo.Pipeline{
-		{{"$match", bson.M{
+		bson.D{{Key: "$match", Value: bson.M{
 			"vehicle_id":   vehicleID,
 			"requested_at": bson.M{"$gte": startDate},
 		}}},
-		{{"$group", bson.M{
+		bson.D{{Key: "$group", Value: bson.M{
 			"_id":            "$status",
 			"count":          bson.M{"$sum": 1},
 			"total_distance": bson.M{"$sum": "$actual_distance"},
@@ -409,8 +410,8 @@ func (r *vehicleRepository) GetVehicleStats(ctx context.Context, vehicleID primi
 	// Calculate maintenance status
 	maintenanceDue := false
 	daysUntilMaintenance := int64(0)
-	if vehicle.NextMaintenance != nil {
-		daysUntilMaintenance = int64(vehicle.NextMaintenance.Sub(time.Now()).Hours() / 24)
+	if vehicle.NextMaintenanceAt != nil {
+		daysUntilMaintenance = int64(vehicle.NextMaintenanceAt.Sub(time.Now()).Hours() / 24)
 		maintenanceDue = daysUntilMaintenance <= 0
 	}
 
@@ -431,8 +432,8 @@ func (r *vehicleRepository) GetVehicleStats(ctx context.Context, vehicleID primi
 		"current_status":         vehicle.Status,
 		"maintenance_due":        maintenanceDue,
 		"days_until_maintenance": daysUntilMaintenance,
-		"last_maintenance":       vehicle.LastMaintenance,
-		"next_maintenance":       vehicle.NextMaintenance,
+		"last_maintenance":       vehicle.LastMaintenanceAt,
+		"next_maintenance":       vehicle.NextMaintenanceAt,
 		"ride_counts_by_status":  rideCounts,
 		"start_date":             startDate,
 		"end_date":               time.Now(),

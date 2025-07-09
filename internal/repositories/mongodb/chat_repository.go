@@ -7,7 +7,9 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
+
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -17,10 +19,10 @@ import (
 type chatRepository struct {
 	chatsCollection    *mongo.Collection
 	messagesCollection *mongo.Collection
-	cache              CacheService
+	cache              services.CacheService
 }
 
-func NewChatRepository(db *mongo.Database, cache CacheService) interfaces.ChatRepository {
+func NewChatRepository(db *mongo.Database, cache services.CacheService) interfaces.ChatRepository {
 	return &chatRepository{
 		chatsCollection:    db.Collection("chats"),
 		messagesCollection: db.Collection("messages"),

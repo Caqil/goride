@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,10 +18,10 @@ import (
 
 type notificationRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewNotificationRepository(db *mongo.Database, cache CacheService) interfaces.NotificationRepository {
+func NewNotificationRepository(db *mongo.Database, cache services.CacheService) interfaces.NotificationRepository {
 	return &notificationRepository{
 		collection: db.Collection("notifications"),
 		cache:      cache,

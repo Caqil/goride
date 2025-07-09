@@ -8,6 +8,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 
 type promotionRepository struct {
 	collection *mongo.Collection
-	cache      CacheService
+	cache      services.CacheService
 }
 
-func NewPromotionRepository(db *mongo.Database, cache CacheService) interfaces.PromotionRepository {
+func NewPromotionRepository(db *mongo.Database, cache services.CacheService) interfaces.PromotionRepository {
 	return &promotionRepository{
 		collection: db.Collection("promotions"),
 		cache:      cache,

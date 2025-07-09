@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 type locationRepository struct {
 	historyCollection  *mongo.Collection
 	geocacheCollection *mongo.Collection
-	cache              CacheService
+	cache              services.CacheService
 }
 
-func NewLocationRepository(db *mongo.Database, cache CacheService) interfaces.LocationRepository {
+func NewLocationRepository(db *mongo.Database, cache services.CacheService) interfaces.LocationRepository {
 	return &locationRepository{
 		historyCollection:  db.Collection("location_history"),
 		geocacheCollection: db.Collection("geocoding_cache"),

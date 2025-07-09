@@ -7,6 +7,7 @@ import (
 
 	"goride/internal/models"
 	"goride/internal/repositories/interfaces"
+	"goride/internal/services"
 	"goride/internal/utils"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,10 +19,10 @@ import (
 type analyticsRepository struct {
 	eventsCollection        *mongo.Collection
 	rideAnalyticsCollection *mongo.Collection
-	cache                   CacheService
+	cache                   services.CacheService
 }
 
-func NewAnalyticsRepository(db *mongo.Database, cache CacheService) interfaces.AnalyticsRepository {
+func NewAnalyticsRepository(db *mongo.Database, cache services.CacheService) interfaces.AnalyticsRepository {
 	return &analyticsRepository{
 		eventsCollection:        db.Collection("analytics_events"),
 		rideAnalyticsCollection: db.Collection("ride_analytics"),
@@ -341,11 +342,11 @@ func (r *analyticsRepository) GetUserActivityTrends(ctx context.Context, days in
 	startDate := time.Now().AddDate(0, 0, -days)
 
 	pipeline := mongo.Pipeline{
-		{{"$match", bson.M{
+		bson.D{{"$match", bson.M{
 			"created_at": bson.M{"$gte": startDate},
 			"event_type": "user_activity",
 		}}},
-		{{"$group", bson.M{
+		bson.D{{"$group", bson.M{
 			"_id": bson.M{
 				"date": bson.M{"$dateToString": bson.M{
 					"format": "%Y-%m-%d",
@@ -355,7 +356,7 @@ func (r *analyticsRepository) GetUserActivityTrends(ctx context.Context, days in
 			},
 			"count": bson.M{"$sum": 1},
 		}}},
-		{{"$sort", bson.M{"_id.date": 1}}},
+		bson.D{{"$sort", bson.M{"_id.date": 1}}},
 	}
 
 	cursor, err := r.eventsCollection.Aggregate(ctx, pipeline)
