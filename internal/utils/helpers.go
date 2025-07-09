@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"crypto/md5"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -303,4 +304,22 @@ func AbsFloat64(a float64) float64 {
 		return -a
 	}
 	return a
+}
+
+// GenerateHashFromString creates an MD5 hash from a string (useful for geocoding cache keys)
+func GenerateHashFromString(input string) string {
+	hash := md5.Sum([]byte(input))
+	return fmt.Sprintf("%x", hash)
+}
+
+// GetStartOfDay returns the start of day for a given time
+func GetStartOfDay(t time.Time) time.Time {
+	year, month, day := t.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
+}
+
+// GetEndOfDay returns the end of day for a given time
+func GetEndOfDay(t time.Time) time.Time {
+	year, month, day := t.Date()
+	return time.Date(year, month, day, 23, 59, 59, 999999999, t.Location())
 }

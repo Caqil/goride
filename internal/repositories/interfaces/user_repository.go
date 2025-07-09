@@ -3,8 +3,9 @@ package interfaces
 import (
 	"context"
 
-	"github.com/uber-clone/internal/models"
-	"github.com/uber-clone/internal/utils"
+	"goride/internal/models"
+	"goride/internal/utils"
+
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 

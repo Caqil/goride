@@ -2,16 +2,17 @@ package utils
 
 import (
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	"strings"
 )
 
 const (
-	letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	numberBytes   = "0123456789"
-	alphanumeric  = letterBytes + numberBytes
-	specialChars  = "!@#$%^&*()_+-=[]{}|;:,.<>?"
-	allChars      = alphanumeric + specialChars
+	letterBytes  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	numberBytes  = "0123456789"
+	alphanumeric = letterBytes + numberBytes
+	specialChars = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+	allChars     = alphanumeric + specialChars
 )
 
 func GenerateRandomString(length int) string {
@@ -33,12 +34,12 @@ func GenerateRandomPassword(length int) string {
 func generateRandom(length int, charset string) string {
 	result := make([]byte, length)
 	charsetLength := big.NewInt(int64(len(charset)))
-	
+
 	for i := range result {
 		num, _ := rand.Int(rand.Reader, charsetLength)
 		result[i] = charset[num.Int64()]
 	}
-	
+
 	return string(result)
 }
 
@@ -56,24 +57,24 @@ func SecureRandomFloat() float64 {
 func GenerateUUID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
-	
+
 	// Set version (4) and variant bits
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	
+
 	return strings.ToLower(fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]))
 }
 
 func GenerateReferralCode() string {
 	// Generate 8 character alphanumeric code
 	code := strings.ToUpper(GenerateRandomString(ReferralCodeLength))
-	
+
 	// Ensure no confusing characters (0, O, I, L)
 	code = strings.ReplaceAll(code, "0", "2")
 	code = strings.ReplaceAll(code, "O", "3")
 	code = strings.ReplaceAll(code, "I", "4")
 	code = strings.ReplaceAll(code, "L", "5")
-	
+
 	return code
 }
 

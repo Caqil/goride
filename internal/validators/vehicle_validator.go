@@ -310,5 +310,5 @@ func isValidVINChecksum(vin string) bool {
 		return checkDigit == 'X'
 	}
 
-	return checkDigit == rune('0'+remainder)
+	return rune(checkDigit) == rune('0'+remainder)
 }

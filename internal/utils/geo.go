@@ -108,6 +108,7 @@ func IsPointInPolygon(point Point, polygon Polygon) bool {
 
 	x, y := point.Lng, point.Lat
 	inside := false
+	var xinters float64 // Declare xinters here with function scope
 
 	p1x, p1y := polygon[0].Lng, polygon[0].Lat
 	for i := 1; i <= len(polygon); i++ {
@@ -117,7 +118,9 @@ func IsPointInPolygon(point Point, polygon Polygon) bool {
 			if y <= math.Max(p1y, p2y) {
 				if x <= math.Max(p1x, p2x) {
 					if p1y != p2y {
-						xinters := (y-p1y)/(p2y-p1y)*(p2x-p1x) + p1x
+						xinters = (y-p1y)/(p2y-p1y)*(p2x-p1x) + p1x
+					} else {
+						xinters = p1x // Assign a default value if p1y == p2y
 					}
 					if p1x == p2x || x <= xinters {
 						inside = !inside

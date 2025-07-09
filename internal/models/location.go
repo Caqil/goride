@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type Location struct {
@@ -28,4 +30,19 @@ func (l Location) Longitude() float64 {
 		return l.Coordinates[0]
 	}
 	return 0
+}
+
+type LocationHistory struct {
+	ID        primitive.ObjectID  `json:"id" bson:"_id,omitempty"`
+	UserID    *primitive.ObjectID `json:"user_id" bson:"user_id"`
+	RideID    *primitive.ObjectID `json:"ride_id" bson:"ride_id"`
+	UserType  UserType            `json:"user_type" bson:"user_type"`
+	Location  Location            `json:"location" bson:"location" validate:"required"`
+	Accuracy  float64             `json:"accuracy" bson:"accuracy"`
+	Speed     float64             `json:"speed" bson:"speed"`
+	Bearing   float64             `json:"bearing" bson:"bearing"`
+	Activity  string              `json:"activity" bson:"activity"` // driving, walking, stationary
+	Source    string              `json:"source" bson:"source"`     // gps, network, passive
+	IsActive  bool                `json:"is_active" bson:"is_active" default:"true"`
+	CreatedAt time.Time           `json:"created_at" bson:"created_at"`
 }

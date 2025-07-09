@@ -1,6 +1,9 @@
 package validators
 
 import (
+	"fmt"
+	"strings"
+
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -34,7 +37,7 @@ type RatingResponseRequest struct {
 
 func ValidateRatingCreate(req *RatingCreateRequest) ValidationErrors {
 	errors := ValidateStruct(req)
-	
+
 	// Validate rating tags
 	validTags := map[string][]string{
 		"rider": {
@@ -64,7 +67,7 @@ func ValidateRatingCreate(req *RatingCreateRequest) ValidationErrors {
 			"vehicle_comfort",
 		},
 	}
-	
+
 	allowedTags := validTags[req.RaterType]
 	for i, tag := range req.Tags {
 		if !contains(allowedTags, tag) {
@@ -74,7 +77,7 @@ func ValidateRatingCreate(req *RatingCreateRequest) ValidationErrors {
 			})
 		}
 	}
-	
+
 	// Validate comment content (basic profanity filter)
 	if req.Comment != "" && containsProfanity(req.Comment) {
 		errors = append(errors, ValidationError{
@@ -82,7 +85,7 @@ func ValidateRatingCreate(req *RatingCreateRequest) ValidationErrors {
 			Message: "Comment contains inappropriate language",
 		})
 	}
-	
+
 	// Validate rating consistency with comment sentiment
 	if req.Rating <= 2.0 && req.Comment == "" {
 		errors = append(errors, ValidationError{
@@ -90,13 +93,13 @@ func ValidateRatingCreate(req *RatingCreateRequest) ValidationErrors {
 			Message: "Comment is required for ratings 2 stars or below",
 		})
 	}
-	
+
 	return errors
 }
 
 func ValidateRatingUpdate(req *RatingUpdateRequest) ValidationErrors {
 	errors := ValidateStruct(req)
-	
+
 	// Validate comment content
 	if req.Comment != "" && containsProfanity(req.Comment) {
 		errors = append(errors, ValidationError{
@@ -104,13 +107,13 @@ func ValidateRatingUpdate(req *RatingUpdateRequest) ValidationErrors {
 			Message: "Comment contains inappropriate language",
 		})
 	}
-	
+
 	return errors
 }
 
 func ValidateRatingReport(req *RatingReportRequest) ValidationErrors {
 	errors := ValidateStruct(req)
-	
+
 	// Validate report reasons
 	validReasons := []string{
 		"inappropriate_language",
@@ -124,7 +127,7 @@ func ValidateRatingReport(req *RatingReportRequest) ValidationErrors {
 		"copyright_violation",
 		"other",
 	}
-	
+
 	reasonFound := false
 	for _, validReason := range validReasons {
 		if strings.Contains(strings.ToLower(req.Reason), validReason) {
@@ -132,20 +135,20 @@ func ValidateRatingReport(req *RatingReportRequest) ValidationErrors {
 			break
 		}
 	}
-	
+
 	if !reasonFound {
 		errors = append(errors, ValidationError{
 			Field:   "reason",
 			Message: "Please provide a valid report reason",
 		})
 	}
-	
+
 	return errors
 }
 
 func ValidateRatingResponse(req *RatingResponseRequest) ValidationErrors {
 	errors := ValidateStruct(req)
-	
+
 	// Validate response content
 	if containsProfanity(req.Response) {
 		errors = append(errors, ValidationError{
@@ -153,7 +156,7 @@ func ValidateRatingResponse(req *RatingResponseRequest) ValidationErrors {
 			Message: "Response contains inappropriate language",
 		})
 	}
-	
+
 	return errors
 }
 
@@ -164,13 +167,13 @@ func containsProfanity(text string) bool {
 		"damn", "hell", "stupid", "idiot", "hate", "awful", "terrible",
 		// Add more words as needed
 	}
-	
+
 	lowerText := strings.ToLower(text)
 	for _, word := range profanityWords {
 		if strings.Contains(lowerText, word) {
 			return true
 		}
 	}
-	
+
 	return false
 }

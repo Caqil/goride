@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/uber-clone/internal/models"
-	"github.com/uber-clone/internal/repositories/interfaces"
-	"github.com/uber-clone/internal/utils"
+	"goride/internal/models"
+	"goride/internal/repositories/interfaces"
+	"goride/internal/utils"
+
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"

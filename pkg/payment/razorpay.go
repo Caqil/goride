@@ -40,31 +40,14 @@ func (r *RazorpayProvider) ProcessPayment(ctx context.Context, request *PaymentR
 		return nil, fmt.Errorf("failed to create order: %w", err)
 	}
 
-	// Create payment
-	paymentData := map[string]interface{}{
-		"amount":   order["amount"],
-		"currency": order["currency"],
-		"order_id": order["id"],
-		"method":   "card",
-		"card": map[string]interface{}{
-			"number":      request.PaymentMethodID,
-			"cvv":         "123", // This should come from the request
-			"expiry_month": "12",  // This should come from the request
-			"expiry_year":  "25",  // This should come from the request
-		},
-	}
-
-	payment, err := r.client.Payment.Create(paymentData, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create payment: %w", err)
-	}
-
+	// Return order details - actual payment will be processed on frontend
+	// In Razorpay, payments are typically authorized on the frontend and then captured
 	return &PaymentResponse{
-		TransactionID: payment["id"].(string),
-		Status:        payment["status"].(string),
-		Amount:        float64(payment["amount"].(int)) / 100,
-		Currency:      payment["currency"].(string),
-		CreatedAt:     int64(payment["created_at"].(int)),
+		TransactionID: order["id"].(string),
+		Status:        "created",
+		Amount:        float64(order["amount"].(int)) / 100,
+		Currency:      order["currency"].(string),
+		CreatedAt:     int64(order["created_at"].(int)),
 	}, nil
 }
 

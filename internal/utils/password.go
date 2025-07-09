@@ -106,14 +106,6 @@ func decodeHash(encodedHash string) (p *PasswordConfig, salt, hash []byte, err e
 	return p, salt, hash, nil
 }
 
-func GenerateRandomPassword(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[SecureRandomInt(len(charset))]
-	}
-	return string(b)
-}
 
 func ValidatePasswordStrength(password string) error {
 	if len(password) < PasswordMinLength {
